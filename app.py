@@ -13,47 +13,6 @@ import re
 import smtplib
 from email.message import EmailMessage
 
-def enviar_email_recuperacao(destinatario, nome, senha, telefone):
-    try:
-        msg = EmailMessage()
-        msg["From"] = st.secrets["email"]["sender_email"]
-        msg["To"] = destinatario
-        msg["Subject"] = "Recuperação de acesso - Rota Nova Iguaçu"
-
-        corpo = f"""
-Olá, {nome}.
-
-Você solicitou a recuperação dos seus dados de acesso ao sistema Rota Nova Iguaçu.
-
-E-mail: {destinatario}
-Senha: {senha}
-Telefone: {telefone}
-
-Caso você NÃO tenha solicitado esta recuperação, ignore este e-mail.
-
-—
-Rota Nova Iguaçu
-"""
-        msg.set_content(corpo)
-
-        server = smtplib.SMTP(
-            st.secrets["email"]["smtp_server"],
-            st.secrets["email"]["smtp_port"]
-        )
-        server.starttls()
-        server.login(
-            st.secrets["email"]["sender_email"],
-            st.secrets["email"]["sender_password"]
-        )
-        server.send_message(msg)
-        server.quit()
-
-        return True
-
-    except Exception as e:
-        st.error(f"Erro ao enviar e-mail: {e}")
-        return False
-
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
 # ==========================================================
@@ -69,31 +28,112 @@ WS_CONFIG = "Config"
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
 
 # ==========================================================
-# GIF NO FINAL DA PÁGINA
+# GIF NO FINAL DA PÁGINA (alteração solicitada)
 # ==========================================================
 GIF_URL = "https://www.imagensanimadas.com/data/media/425/onibus-imagem-animada-0024.gif"
 
+
 # ==========================================================
-# TELEFONE
+# RECUPERACAO POR EMAIL (NAO EXIBE SENHA NA TELA)
+# ==========================================================
+def _email_cfg():
+    """
+    Esperado em st.secrets (recomendado):
+    [email]
+    sender_email = "transporteni2026@gmail.com"
+    sender_password = "SENHA_DE_APP_AQUI"
+    smtp_server = "smtp.gmail.com"
+    smtp_port = 587
+
+    Alternativa (legado):
+    email_sender_email / email_sender_password / email_smtp_server / email_smtp_port
+    """
+    if "email" in st.secrets:
+        e = st.secrets["email"]
+        sender_email = str(e.get("sender_email", "")).strip()
+        sender_password = str(e.get("sender_password", "")).strip()
+        smtp_server = str(e.get("smtp_server", "smtp.gmail.com")).strip()
+        smtp_port = int(e.get("smtp_port", 587))
+    else:
+        sender_email = str(st.secrets.get("email_sender_email", "")).strip()
+        sender_password = str(st.secrets.get("email_sender_password", "")).strip()
+        smtp_server = str(st.secrets.get("email_smtp_server", "smtp.gmail.com")).strip()
+        smtp_port = int(st.secrets.get("email_smtp_port", 587))
+
+    return sender_email, sender_password, smtp_server, smtp_port
+
+
+def enviar_email_recuperacao(destinatario: str, nome: str, senha: str, telefone: str):
+    """
+    Retorna (ok, msg).
+    """
+    try:
+        sender_email, sender_password, smtp_server, smtp_port = _email_cfg()
+
+        if not sender_email or not sender_password:
+            return False, "Config de email ausente no Secrets (sender_email/sender_password)."
+
+        msg = EmailMessage()
+        msg["From"] = sender_email
+        msg["To"] = destinatario
+        msg["Subject"] = "Recuperacao de acesso - Rota Nova Iguacu"
+
+        corpo = (
+            f"Ola, {nome}.\n\n"
+            f"Voce solicitou a recuperacao dos seus dados de acesso.\n\n"
+            f"Email: {destinatario}\n"
+            f"Senha: {senha}\n"
+            f"Telefone: {telefone}\n\n"
+            "Se voce NAO solicitou esta recuperacao, ignore este email.\n\n"
+            "Rota Nova Iguacu"
+        )
+        msg.set_content(corpo)
+
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+
+        return True, "Enviado"
+    except Exception as e:
+        return False, str(e)
+
+
+# ==========================================================
+# TELEFONE:
 # ==========================================================
 def tel_only_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s or ""))
 
 def tel_format_br(digits: str) -> str:
+    """
+    Formata 11 dígitos como: (xx) xxxxx.xxxx
+    Se tiver menos, retorna o que der sem quebrar.
+    """
     d = tel_only_digits(digits)
-    if len(d) < 2:
+    if len(d) >= 2:
+        ddd = d[:2]
+        rest = d[2:]
+    else:
         return d
-    ddd = d[:2]
-    rest = d[2:]
+
     if len(rest) >= 9:
-        return f"({ddd}) {rest[:5]}.{rest[5:9]}"
-    return f"({ddd}) {rest}"
+        p1 = rest[:5]
+        p2 = rest[5:9]
+        return f"({ddd}) {p1}.{p2}"
+    elif len(rest) > 5:
+        p1 = rest[:5]
+        p2 = rest[5:]
+        return f"({ddd}) {p1}.{p2}"
+    else:
+        return f"({ddd}) {rest}"
 
 def tel_is_valid_11(s: str) -> bool:
     return len(tel_only_digits(s)) == 11
 
+
 # ==========================================================
-# WRAPPER RETRY / BACKOFF
+# WRAPPER COM RETRY / BACKOFF PARA 429
 # ==========================================================
 def gs_call(func, *args, **kwargs):
     max_tries = 6
@@ -103,22 +143,22 @@ def gs_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except APIError as e:
             msg = str(e)
-            if any(x in msg for x in ["429", "Quota exceeded", "RESOURCE_EXHAUSTED", "500", "502", "503", "504"]):
-                time_module.sleep(min((base * (2 ** attempt)) + random.uniform(0, 0.35), 6))
+            is_429 = ("429" in msg) or ("Quota exceeded" in msg) or ("RESOURCE_EXHAUSTED" in msg)
+            is_5xx = any(code in msg for code in ["500", "502", "503", "504"])
+            if is_429 or is_5xx:
+                sleep_s = (base * (2 ** attempt)) + random.uniform(0.0, 0.35)
+                time_module.sleep(min(sleep_s, 6.0))
                 continue
             raise
-    raise APIError("Google Sheets: muitas requisições (429).")
+    raise APIError("Google Sheets: muitas requisições (429). Tente novamente em instantes.")
+
 
 # ==========================================================
-# CONEXÃO (CORRIGIDA E BLINDADA)
+# CONEXÕES (CACHE_RESOURCE)
 # ==========================================================
 @st.cache_resource
 def conectar_gsheets():
-    info = dict(st.secrets["gcp_service_account"])
-
-    # 🔴 CORREÇÃO CRÍTICA
-    info["private_key"] = info["private_key"].replace("\\n", "\n")
-
+    info = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -129,11 +169,13 @@ def abrir_documento():
 
 @st.cache_resource
 def ws_usuarios():
-    return gs_call(abrir_documento().worksheet, WS_USUARIOS)
+    doc = abrir_documento()
+    return gs_call(doc.worksheet, WS_USUARIOS)
 
 @st.cache_resource
 def ws_presenca():
-    return abrir_documento().sheet1
+    doc = abrir_documento()
+    return doc.sheet1
 
 @st.cache_resource
 def ws_config():
@@ -141,9 +183,10 @@ def ws_config():
     try:
         return gs_call(doc.worksheet, WS_CONFIG)
     except Exception:
-        sheet = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
-        gs_call(sheet.update, "A1:A2", [["LIMITE"], ["100"]])
-        return sheet
+        sheet_c = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
+        gs_call(sheet_c.update, "A1:A2", [["LIMITE"], ["100"]])
+        return sheet_c
+
 
 # ==========================================================
 # LEITURAS (CACHE_DATA)
@@ -572,6 +615,10 @@ try:
 
                     cadastrou = st.form_submit_button("✍️ SALVAR CADASTRO 👈", use_container_width=True)
                     if cadastrou:
+                        # ==========================================================
+                        # OBRIGATÓRIO: todos os campos do CADASTRO
+                        # (alteração solicitada)
+                        # ==========================================================
                         def norm_str(x):
                             return str(x or "").strip()
 
@@ -582,6 +629,7 @@ try:
                         n_g_ok = bool(norm_str(n_g))
                         n_o_ok = bool(norm_str(n_o))
 
+                        # e-mail básico
                         email_ok = bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", norm_str(n_e)))
 
                         missing = []
@@ -597,6 +645,10 @@ try:
                         if missing:
                             st.error("Preencha corretamente todos os campos: " + ", ".join(missing) + ".")
                         else:
+                            # ==========================================================
+                            # BLOQUEAR CADASTRO SE EMAIL OU TELEFONE JÁ EXISTIREM
+                            # (alteração solicitada)
+                            # ==========================================================
                             novo_email = norm_str(n_e).lower()
                             novo_tel_digits = tel_only_digits(fmt_tel_cad)
 
@@ -647,31 +699,43 @@ try:
             """)
 
         with t4:
+
             e_r = st.text_input("E-mail cadastrado:")
+
             rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
 
             if rec_btn:
-                u_r = next(
-                    (u for u in records_u_public
-                     if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()),
-                    None
-                )
+
+                u_r = next((u for u in records_u_public if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()), None)
+
+                # Resposta generica para nao permitir descoberta de emails cadastrados
 
                 if u_r:
-                    # Chame sua função de envio aqui
-                    enviado = enviar_email_recuperacao(
-                        destinatario=u_r.get("Email"),
-                        nome=u_r.get("Nome"),
-                        senha=u_r.get("Senha"),
-                        telefone=u_r.get("TELEFONE")
+
+                    ok, msg = enviar_email_recuperacao(
+
+                        destinatario=str(u_r.get("Email", "")).strip(),
+
+                        nome=str(u_r.get("Nome", "")).strip(),
+
+                        senha=str(u_r.get("Senha", "")).strip(),
+
+                        telefone=str(u_r.get("TELEFONE", "")).strip()
+
                     )
 
-                    if enviado:
-                        st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
+                    if ok:
+
+                        st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados.")
+
                     else:
-                        st.error("❌ Não foi possível enviar o e-mail no momento.")
+
+                        st.error(f"❌ Falha ao enviar e-mail. Verifique Secrets. Detalhe: {msg}")
+
                 else:
-                    st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
+
+                    st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados.")
+
 
         with t5:
             with st.form("form_admin"):
@@ -686,8 +750,6 @@ try:
                     else:
                         st.error("ADM inválido.")
 
-except Exception as e:
-    st.error(f"⚠️ Erro: {e}")
     # =========================================
     # PAINEL ADM
     # =========================================
@@ -910,6 +972,3 @@ except Exception as e:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
-
