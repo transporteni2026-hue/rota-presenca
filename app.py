@@ -90,7 +90,11 @@ def gs_call(func, *args, **kwargs):
 # ==========================================================
 @st.cache_resource
 def conectar_gsheets():
-    info = st.secrets["gcp_service_account"]
+    # AJUSTE SOLICITADO PARA RESOLVER ERRO DE BASE64
+    info = st.secrets["gcp_service_account"].to_dict()
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -739,7 +743,9 @@ try:
         sair_user = st.sidebar.button("⬅️ Sair", use_container_width=True)
         if sair_user:
             for key in list(st.session_state.keys()):
-                del st.session_state[key]
+                # Corrigindo para não causar erro durante a iteração
+                if key in st.session_state:
+                    del st.session_state[key]
             st.rerun()
 
         st.sidebar.markdown("---")
