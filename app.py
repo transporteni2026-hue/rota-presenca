@@ -91,11 +91,6 @@ def gs_call(func, *args, **kwargs):
 @st.cache_resource
 def conectar_gsheets():
     info = st.secrets["gcp_service_account"].to_dict()
-    
-    # ÚNICA ALTERAÇÃO AUTORIZADA: Limpeza da chave para evitar erro Base64
-    if "private_key" in info:
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
-        
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -881,3 +876,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
