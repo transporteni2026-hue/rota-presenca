@@ -572,10 +572,6 @@ try:
 
                     cadastrou = st.form_submit_button("✍️ SALVAR CADASTRO 👈", use_container_width=True)
                     if cadastrou:
-                        # ==========================================================
-                        # OBRIGATÓRIO: todos os campos do CADASTRO
-                        # (alteração solicitada)
-                        # ==========================================================
                         def norm_str(x):
                             return str(x or "").strip()
 
@@ -586,7 +582,6 @@ try:
                         n_g_ok = bool(norm_str(n_g))
                         n_o_ok = bool(norm_str(n_o))
 
-                        # e-mail básico
                         email_ok = bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", norm_str(n_e)))
 
                         missing = []
@@ -602,10 +597,6 @@ try:
                         if missing:
                             st.error("Preencha corretamente todos os campos: " + ", ".join(missing) + ".")
                         else:
-                            # ==========================================================
-                            # BLOQUEAR CADASTRO SE EMAIL OU TELEFONE JÁ EXISTIREM
-                            # (alteração solicitada)
-                            # ==========================================================
                             novo_email = norm_str(n_e).lower()
                             novo_tel_digits = tel_only_digits(fmt_tel_cad)
 
@@ -655,32 +646,32 @@ try:
             * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Sendo assim, caso queira manter um histórico de viagem, antes desses horários, faça o download do pdf e/ou do resumo do W.Zap.
             """)
 
-with t4:
-    e_r = st.text_input("E-mail cadastrado:")
-    rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
+        with t4:
+            e_r = st.text_input("E-mail cadastrado:")
+            rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
 
-    if rec_btn:
-        u_r = next(
-            (u for u in records_u_public
-             if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()),
-            None
-        )
+            if rec_btn:
+                u_r = next(
+                    (u for u in records_u_public
+                     if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()),
+                    None
+                )
 
-        if u_r:
-            enviado = enviar_email_recuperacao(
-                destinatario=u_r.get("Email"),
-                nome=u_r.get("Nome"),
-                senha=u_r.get("Senha"),
-                telefone=u_r.get("TELEFONE")
-            )
+                if u_r:
+                    # Chame sua função de envio aqui
+                    enviado = enviar_email_recuperacao(
+                        destinatario=u_r.get("Email"),
+                        nome=u_r.get("Nome"),
+                        senha=u_r.get("Senha"),
+                        telefone=u_r.get("TELEFONE")
+                    )
 
-            if enviado:
-                st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
-            else:
-                st.error("❌ Não foi possível enviar o e-mail no momento.")
-        else:
-            # Mensagem neutra (não revela se o e-mail existe)
-            st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
+                    if enviado:
+                        st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
+                    else:
+                        st.error("❌ Não foi possível enviar o e-mail no momento.")
+                else:
+                    st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
 
         with t5:
             with st.form("form_admin"):
@@ -695,6 +686,8 @@ with t4:
                     else:
                         st.error("ADM inválido.")
 
+except Exception as e:
+    st.error(f"⚠️ Erro: {e}")
     # =========================================
     # PAINEL ADM
     # =========================================
@@ -917,5 +910,6 @@ with t4:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
 
 
