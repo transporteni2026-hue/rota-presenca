@@ -10,6 +10,49 @@ import urllib.parse
 import time as time_module
 import random
 import re
+import smtplib
+from email.message import EmailMessage
+
+def enviar_email_recuperacao(destinatario, nome, senha, telefone):
+    try:
+        msg = EmailMessage()
+        msg["From"] = st.secrets["email"]["sender_email"]
+        msg["To"] = destinatario
+        msg["Subject"] = "Recuperação de acesso - Rota Nova Iguaçu"
+
+        corpo = f"""
+Olá, {nome}.
+
+Você solicitou a recuperação dos seus dados de acesso ao sistema Rota Nova Iguaçu.
+
+E-mail: {destinatario}
+Senha: {senha}
+Telefone: {telefone}
+
+Caso você NÃO tenha solicitado esta recuperação, ignore este e-mail.
+
+—
+Rota Nova Iguaçu
+"""
+        msg.set_content(corpo)
+
+        server = smtplib.SMTP(
+            st.secrets["email"]["smtp_server"],
+            st.secrets["email"]["smtp_port"]
+        )
+        server.starttls()
+        server.login(
+            st.secrets["email"]["sender_email"],
+            st.secrets["email"]["sender_password"]
+        )
+        server.send_message(msg)
+        server.quit()
+
+        return True
+
+    except Exception as e:
+        st.error(f"Erro ao enviar e-mail: {e}")
+        return False
 
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
@@ -612,15 +655,32 @@ try:
             * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Sendo assim, caso queira manter um histórico de viagem, antes desses horários, faça o download do pdf e/ou do resumo do W.Zap.
             """)
 
-        with t4:
-            e_r = st.text_input("E-mail cadastrado:")
-            rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
-            if rec_btn:
-                u_r = next((u for u in records_u_public if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()), None)
-                if u_r:
-                    st.info(f"Usuário: {u_r.get('Nome')} | Senha: {u_r.get('Senha')} | Tel: {u_r.get('TELEFONE')}")
-                else:
-                    st.error("E-mail não encontrado.")
+with t4:
+    e_r = st.text_input("E-mail cadastrado:")
+    rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
+
+    if rec_btn:
+        u_r = next(
+            (u for u in records_u_public
+             if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()),
+            None
+        )
+
+        if u_r:
+            enviado = enviar_email_recuperacao(
+                destinatario=u_r.get("Email"),
+                nome=u_r.get("Nome"),
+                senha=u_r.get("Senha"),
+                telefone=u_r.get("TELEFONE")
+            )
+
+            if enviado:
+                st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
+            else:
+                st.error("❌ Não foi possível enviar o e-mail no momento.")
+        else:
+            # Mensagem neutra (não revela se o e-mail existe)
+            st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados com sucesso.")
 
         with t5:
             with st.form("form_admin"):
@@ -857,4 +917,5 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
 
