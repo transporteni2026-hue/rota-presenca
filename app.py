@@ -26,46 +26,31 @@ WS_CONFIG = "Config"
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
 
 # ==========================================================
-# GIF NO FINAL DA PÁGINA (alteração solicitada)
+# GIF NO FINAL DA PÁGINA
 # ==========================================================
 GIF_URL = "https://www.imagensanimadas.com/data/media/425/onibus-imagem-animada-0024.gif"
 
-
 # ==========================================================
-# TELEFONE:
+# TELEFONE
 # ==========================================================
 def tel_only_digits(s: str) -> str:
     return re.sub(r"\D+", "", str(s or ""))
 
 def tel_format_br(digits: str) -> str:
-    """
-    Formata 11 dígitos como: (xx) xxxxx.xxxx
-    Se tiver menos, retorna o que der sem quebrar.
-    """
     d = tel_only_digits(digits)
-    if len(d) >= 2:
-        ddd = d[:2]
-        rest = d[2:]
-    else:
+    if len(d) < 2:
         return d
-
+    ddd = d[:2]
+    rest = d[2:]
     if len(rest) >= 9:
-        p1 = rest[:5]
-        p2 = rest[5:9]
-        return f"({ddd}) {p1}.{p2}"
-    elif len(rest) > 5:
-        p1 = rest[:5]
-        p2 = rest[5:]
-        return f"({ddd}) {p1}.{p2}"
-    else:
-        return f"({ddd}) {rest}"
+        return f"({ddd}) {rest[:5]}.{rest[5:9]}"
+    return f"({ddd}) {rest}"
 
 def tel_is_valid_11(s: str) -> bool:
     return len(tel_only_digits(s)) == 11
 
-
 # ==========================================================
-# WRAPPER COM RETRY / BACKOFF PARA 429
+# WRAPPER RETRY / BACKOFF
 # ==========================================================
 def gs_call(func, *args, **kwargs):
     max_tries = 6
@@ -75,22 +60,22 @@ def gs_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except APIError as e:
             msg = str(e)
-            is_429 = ("429" in msg) or ("Quota exceeded" in msg) or ("RESOURCE_EXHAUSTED" in msg)
-            is_5xx = any(code in msg for code in ["500", "502", "503", "504"])
-            if is_429 or is_5xx:
-                sleep_s = (base * (2 ** attempt)) + random.uniform(0.0, 0.35)
-                time_module.sleep(min(sleep_s, 6.0))
+            if any(x in msg for x in ["429", "Quota exceeded", "RESOURCE_EXHAUSTED", "500", "502", "503", "504"]):
+                time_module.sleep(min((base * (2 ** attempt)) + random.uniform(0, 0.35), 6))
                 continue
             raise
-    raise APIError("Google Sheets: muitas requisições (429). Tente novamente em instantes.")
-
+    raise APIError("Google Sheets: muitas requisições (429).")
 
 # ==========================================================
-# CONEXÕES (CACHE_RESOURCE)
+# CONEXÃO (CORRIGIDA E BLINDADA)
 # ==========================================================
 @st.cache_resource
 def conectar_gsheets():
-    info = st.secrets["gcp_service_account"]
+    info = dict(st.secrets["gcp_service_account"])
+
+    # 🔴 CORREÇÃO CRÍTICA
+    info["private_key"] = info["private_key"].replace("\\n", "\n")
+
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -101,13 +86,11 @@ def abrir_documento():
 
 @st.cache_resource
 def ws_usuarios():
-    doc = abrir_documento()
-    return gs_call(doc.worksheet, WS_USUARIOS)
+    return gs_call(abrir_documento().worksheet, WS_USUARIOS)
 
 @st.cache_resource
 def ws_presenca():
-    doc = abrir_documento()
-    return doc.sheet1
+    return abrir_documento().sheet1
 
 @st.cache_resource
 def ws_config():
@@ -115,10 +98,9 @@ def ws_config():
     try:
         return gs_call(doc.worksheet, WS_CONFIG)
     except Exception:
-        sheet_c = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
-        gs_call(sheet_c.update, "A1:A2", [["LIMITE"], ["100"]])
-        return sheet_c
-
+        sheet = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
+        gs_call(sheet.update, "A1:A2", [["LIMITE"], ["100"]])
+        return sheet
 
 # ==========================================================
 # LEITURAS (CACHE_DATA)
@@ -875,3 +857,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
