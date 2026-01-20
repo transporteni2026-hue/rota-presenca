@@ -10,8 +10,6 @@ import urllib.parse
 import time as time_module
 import random
 import re
-import smtplib
-from email.message import EmailMessage
 
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
@@ -31,72 +29,6 @@ FUSO_BR = pytz.timezone("America/Sao_Paulo")
 # GIF NO FINAL DA PÁGINA (alteração solicitada)
 # ==========================================================
 GIF_URL = "https://www.imagensanimadas.com/data/media/425/onibus-imagem-animada-0024.gif"
-
-
-# ==========================================================
-# RECUPERACAO POR EMAIL (NAO EXIBE SENHA NA TELA)
-# ==========================================================
-def _email_cfg():
-    """
-    Esperado em st.secrets (recomendado):
-    [email]
-    sender_email = "transporteni2026@gmail.com"
-    sender_password = "SENHA_DE_APP_AQUI"
-    smtp_server = "smtp.gmail.com"
-    smtp_port = 587
-
-    Alternativa (legado):
-    email_sender_email / email_sender_password / email_smtp_server / email_smtp_port
-    """
-    if "email" in st.secrets:
-        e = st.secrets["email"]
-        sender_email = str(e.get("sender_email", "")).strip()
-        sender_password = str(e.get("sender_password", "")).strip()
-        smtp_server = str(e.get("smtp_server", "smtp.gmail.com")).strip()
-        smtp_port = int(e.get("smtp_port", 587))
-    else:
-        sender_email = str(st.secrets.get("email_sender_email", "")).strip()
-        sender_password = str(st.secrets.get("email_sender_password", "")).strip()
-        smtp_server = str(st.secrets.get("email_smtp_server", "smtp.gmail.com")).strip()
-        smtp_port = int(st.secrets.get("email_smtp_port", 587))
-
-    return sender_email, sender_password, smtp_server, smtp_port
-
-
-def enviar_email_recuperacao(destinatario: str, nome: str, senha: str, telefone: str):
-    """
-    Retorna (ok, msg).
-    """
-    try:
-        sender_email, sender_password, smtp_server, smtp_port = _email_cfg()
-
-        if not sender_email or not sender_password:
-            return False, "Config de email ausente no Secrets (sender_email/sender_password)."
-
-        msg = EmailMessage()
-        msg["From"] = sender_email
-        msg["To"] = destinatario
-        msg["Subject"] = "Recuperacao de acesso - Rota Nova Iguacu"
-
-        corpo = (
-            f"Ola, {nome}.\n\n"
-            f"Voce solicitou a recuperacao dos seus dados de acesso.\n\n"
-            f"Email: {destinatario}\n"
-            f"Senha: {senha}\n"
-            f"Telefone: {telefone}\n\n"
-            "Se voce NAO solicitou esta recuperacao, ignore este email.\n\n"
-            "Rota Nova Iguacu"
-        )
-        msg.set_content(corpo)
-
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=20) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-
-        return True, "Enviado"
-    except Exception as e:
-        return False, str(e)
 
 
 # ==========================================================
@@ -699,43 +631,39 @@ try:
             """)
 
         with t4:
+            st.markdown("### 🔐 Recuperar acesso")
+            st.caption("Para sua segurança, confirme **E-mail + Telefone** (DDD + 9 dígitos).")
 
             e_r = st.text_input("E-mail cadastrado:")
+            raw_tel_rec = st.text_input("Telefone cadastrado:", value=st.session_state.get("_tel_rec_fmt", ""))
+            fmt_tel_rec = tel_format_br(raw_tel_rec)
+            st.session_state["_tel_rec_fmt"] = fmt_tel_rec
 
             rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
-
             if rec_btn:
+                if not e_r.strip():
+                    st.error("Informe o e-mail cadastrado.")
+                elif not tel_is_valid_11(fmt_tel_rec):
+                    st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
+                else:
+                    tel_rec_digits = tel_only_digits(fmt_tel_rec)
 
-                u_r = next((u for u in records_u_public if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()), None)
-
-                # Resposta generica para nao permitir descoberta de emails cadastrados
-
-                if u_r:
-
-                    ok, msg = enviar_email_recuperacao(
-
-                        destinatario=str(u_r.get("Email", "")).strip(),
-
-                        nome=str(u_r.get("Nome", "")).strip(),
-
-                        senha=str(u_r.get("Senha", "")).strip(),
-
-                        telefone=str(u_r.get("TELEFONE", "")).strip()
-
+                    u_r = next(
+                        (u for u in records_u_public
+                         if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()
+                         and tel_only_digits(u.get("TELEFONE", "")) == tel_rec_digits),
+                        None
                     )
 
-                    if ok:
-
-                        st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados.")
-
+                    if u_r:
+                        # Exibe na tela (sem envio de e-mail)
+                        st.info(
+                            f"Usuário: {u_r.get('Nome')} | "
+                            f"Senha: {u_r.get('Senha')} | "
+                            f"Tel: {u_r.get('TELEFONE')}"
+                        )
                     else:
-
-                        st.error(f"❌ Falha ao enviar e-mail. Verifique Secrets. Detalhe: {msg}")
-
-                else:
-
-                    st.success("📧 Se o e-mail estiver cadastrado, os dados foram enviados.")
-
+                        st.error("Dados não encontrados (verifique e-mail e telefone).")
 
         with t5:
             with st.form("form_admin"):
@@ -911,7 +839,7 @@ try:
 
             if st.session_state.conf_ativa and (dados_p_show and len(dados_p_show) > 1):
                 for i, row in df_o.iterrows():
-                    label = f"{row.get('Nº','')} - {row.get('GRADUAÇÃO','')} {row.get('NOME','')} - {row.get('LOTAÇÃO','')}".strip()
+                    label = f"{row.get('Nº','')} - {row.get('NOME','')}".strip()
                     _ = st.checkbox(label if label else " ", key=f"chk_p_{i}")
 
         if dados_p_show and len(dados_p_show) > 1:
@@ -972,4 +900,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
