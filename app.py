@@ -90,7 +90,10 @@ def gs_call(func, *args, **kwargs):
 # ==========================================================
 @st.cache_resource
 def conectar_gsheets():
-    info = st.secrets["gcp_service_account"]
+    info = dict(st.secrets["gcp_service_account"])
+    # Correção crítica (Streamlit Secrets pode vir com \n)
+    if \"private_key\" in info and isinstance(info[\"private_key\"], str):
+        info[\"private_key\"] = info[\"private_key\"].replace(\"\\n\", \"\n\")
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -118,6 +121,89 @@ def ws_config():
         sheet_c = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
         gs_call(sheet_c.update, "A1:A2", [["LIMITE"], ["100"]])
         return sheet_c
+
+
+# ==========================================================
+# SENHA TEMPORÁRIA (1 acesso) - RECUPERAÇÃO SEGURA
+# ==========================================================
+TEMP_HEADERS = ["TEMP_SENHA", "TEMP_EXPIRA", "TEMP_USADA"]
+
+def _br_now():
+    return datetime.now(FUSO_BR)
+
+def _fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+def _parse_dt(s: str):
+    try:
+        return FUSO_BR.localize(datetime.strptime(str(s).strip(), "%d/%m/%Y %H:%M:%S"))
+    except Exception:
+        return None
+
+def gerar_senha_temp(tam: int = 10) -> str:
+    # Evita caracteres ambíguos
+    alfabeto = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(random.choice(alfabeto) for _ in range(tam))
+
+def ensure_temp_cols(sheet_u):
+    """
+    Garante colunas TEMP_* na planilha Usuarios:
+    TEMP_SENHA | TEMP_EXPIRA | TEMP_USADA
+    """
+    headers = gs_call(sheet_u.row_values, 1)
+    headers = [str(h).strip() for h in headers if str(h).strip() != ""]
+    missing = [h for h in TEMP_HEADERS if h not in headers]
+    if not missing:
+        return {h: headers.index(h) + 1 for h in TEMP_HEADERS}
+
+    new_headers = headers + missing
+    try:
+        gs_call(sheet_u.update, "A1", [new_headers])
+    except Exception:
+        gs_call(sheet_u.update, "A1", [new_headers])
+
+    rows = gs_call(sheet_u.get_all_values)
+    n_rows = len(rows)
+    if n_rows >= 2:
+        for h in missing:
+            col_idx = new_headers.index(h) + 1
+            # bloqueia tokens antigos
+            vals = [["SIM"]] * (n_rows - 1) if h == "TEMP_USADA" else [[""]] * (n_rows - 1)
+            col_letter = gspread.utils.rowcol_to_a1(1, col_idx).rstrip("1")
+            rng_col = f"{col_letter}2:{col_letter}{n_rows}"
+            gs_call(sheet_u.update, rng_col, vals)
+
+    return {h: new_headers.index(h) + 1 for h in TEMP_HEADERS}
+
+def find_user_row_by_email_tel(sheet_u, email: str, tel_digits: str):
+    email = str(email or "").strip().lower()
+    tel_digits = tel_only_digits(tel_digits)
+
+    rows = gs_call(sheet_u.get_all_values)
+    if not rows or len(rows) < 2:
+        return None, None
+
+    headers = [str(h).strip() for h in rows[0]]
+    if "Email" in headers:
+        i_email = headers.index("Email")
+    elif "EMAIL" in headers:
+        i_email = headers.index("EMAIL")
+    else:
+        return None, None
+
+    if "TELEFONE" not in headers:
+        return None, None
+    i_tel = headers.index("TELEFONE")
+
+    for idx in range(1, len(rows)):
+        r = rows[idx] + [""] * (len(headers) - len(rows[idx]))
+        em = str(r[i_email]).strip().lower()
+        te = tel_only_digits(r[i_tel])
+        if em == email and te == tel_digits:
+            d = {headers[j]: (r[j] if j < len(r) else "") for j in range(len(headers))}
+            return idx + 1, d
+    return None, None
+
 
 
 # ==========================================================
@@ -468,6 +554,12 @@ if "usuario_logado" not in st.session_state:
     st.session_state.usuario_logado = None
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+if "_force_password_change" not in st.session_state:
+    st.session_state._force_password_change = False
+if "_pwd_change_row" not in st.session_state:
+    st.session_state._pwd_change_row = None
+if "_login_kind" not in st.session_state:
+    st.session_state._login_kind = ""
 if "conf_ativa" not in st.session_state:
     st.session_state.conf_ativa = False
 if "_force_refresh_presenca" not in st.session_state:
@@ -485,6 +577,11 @@ try:
     records_u_public = buscar_usuarios_cadastrados()
     limite_max = buscar_limite_dinamico()
     sheet_u_escrita = ws_usuarios()
+    # Garante colunas TEMP_* para recuperação segura
+    try:
+        ensure_temp_cols(sheet_u_escrita)
+    except Exception:
+        pass
 
     # =========================================
     # LOGIN / CADASTRO / INSTRUÇÕES / RECUPERAR / ADM
@@ -509,19 +606,58 @@ try:
                     else:
                         tel_login_digits = tel_only_digits(fmt_tel_login)
 
+                        def _senha_temp_valida(u_dict):
+                            try:
+                                temp = str(u_dict.get("TEMP_SENHA", "") or "").strip()
+                                usada = str(u_dict.get("TEMP_USADA", "") or "").strip().upper()
+                                exp = str(u_dict.get("TEMP_EXPIRA", "") or "").strip()
+                                if not temp or usada != "NAO":
+                                    return False
+                                exp_dt = _parse_dt(exp)
+                                if exp_dt is None:
+                                    return False
+                                return _br_now() <= exp_dt
+                            except Exception:
+                                return False
+
+                        def _senha_confere(u_dict, senha_digitada: str):
+                            senha_digitada = str(senha_digitada or "")
+                            if str(u_dict.get("Senha", "")) == senha_digitada:
+                                return ("REAL", True)
+                            if _senha_temp_valida(u_dict) and str(u_dict.get("TEMP_SENHA", "")).strip() == senha_digitada:
+                                return ("TEMP", True)
+                            return ("", False)
+
                         u_a = next(
                             (u for u in records_u_public
                              if str(u.get("Email", "")).strip().lower() == l_e.strip().lower()
-                             and str(u.get("Senha", "")) == str(l_s)
-                             and tel_only_digits(u.get("TELEFONE", "")) == tel_login_digits),
+                             and tel_only_digits(u.get("TELEFONE", "")) == tel_login_digits
+                             and _senha_confere(u, l_s)[1]),
                             None
-                        )
-
-                        if u_a:
+                        )if u_a:
                             status_user = str(u_a.get("STATUS", "")).strip().upper()
                             if status_user == "ATIVO":
+                                kind, ok = _senha_confere(u_a, l_s)
                                 st.session_state.usuario_logado = u_a
+                                st.session_state._login_kind = kind
+
+                                if kind == "TEMP":
+                                    try:
+                                        temp_cols = ensure_temp_cols(sheet_u_escrita)
+                                        row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, l_e, tel_login_digits)
+                                        if row_idx:
+                                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
+                                            buscar_usuarios_cadastrados.clear()
+                                            buscar_usuarios_admin.clear()
+                                            st.session_state._force_password_change = True
+                                            st.session_state._pwd_change_row = row_idx
+                                    except Exception:
+                                        st.session_state._force_password_change = True
+                                        st.session_state._pwd_change_row = None
+
                                 st.rerun()
+                            else:
+                                st.error("Acesso negado. Aguardando aprovação do Administrador.")
                             else:
                                 st.error("Acesso negado. Aguardando aprovação do Administrador.")
                         else:
@@ -615,8 +751,8 @@ try:
             st.markdown("**No Chrome (Android):** Toque nos 3 pontos (⋮) e em 'Instalar Aplicativo'.")
             st.markdown("**No Safari (iPhone):** Toque em Compartilhar (⬆️) e em 'Adicionar à Tela de Início'.")
             st.markdown("**No Telegram:** Procure o bot `@RotaNovaIguacuBot` e toque no botão 'Abrir App Rota' no menu.")
-            st.markdown("**QR CODE:** https://drive.google.com/file/d/1yeDG_CNCmqTeTn98WKuKCJjSynfhSB8Q/view?usp=sharing")
-            st.markdown("**LINK PARA NAVEGADOR:** https://rota-presenca-5hcorx5wezfaezztkehwol.streamlit.app/")
+            st.markdown("**QR CODE:** https://drive.google.com/file/d/1RU1i0u1hSqdfaL3H7HUaeV4hRvR2cROf/view?usp=sharing")
+            st.markdown("**LINK PARA NAVEGADOR:** https://presenca-rota-gbiwh9bjrwdergzc473xyg.streamlit.app/")
             st.divider()
             st.info("**CADASTRO E LOGIN:** Use seu e-mail como identificador único.")
             st.markdown("""
@@ -632,14 +768,14 @@ try:
 
         with t4:
             st.markdown("### 🔐 Recuperar acesso")
-            st.caption("Para sua segurança, confirme **E-mail + Telefone** (DDD + 9 dígitos).")
+            st.caption("Confirme **E-mail + Telefone**. Será gerada uma **senha temporária** válida para **apenas 1 acesso** (expira em 10 minutos).")
 
             e_r = st.text_input("E-mail cadastrado:")
             raw_tel_rec = st.text_input("Telefone cadastrado:", value=st.session_state.get("_tel_rec_fmt", ""))
             fmt_tel_rec = tel_format_br(raw_tel_rec)
             st.session_state["_tel_rec_fmt"] = fmt_tel_rec
 
-            rec_btn = st.button("👾 RECUPERAR DADOS 👾", use_container_width=True)
+            rec_btn = st.button("👾 GERAR SENHA TEMPORÁRIA 👾", use_container_width=True)
             if rec_btn:
                 if not e_r.strip():
                     st.error("Informe o e-mail cadastrado.")
@@ -648,20 +784,23 @@ try:
                 else:
                     tel_rec_digits = tel_only_digits(fmt_tel_rec)
 
-                    u_r = next(
-                        (u for u in records_u_public
-                         if str(u.get("Email", "")).strip().lower() == e_r.strip().lower()
-                         and tel_only_digits(u.get("TELEFONE", "")) == tel_rec_digits),
-                        None
-                    )
+                    row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, e_r, tel_rec_digits)
 
-                    if u_r:
-                        # Exibe na tela (sem envio de e-mail)
-                        st.info(
-                            f"Usuário: {u_r.get('Nome')} | "
-                            f"Senha: {u_r.get('Senha')} | "
-                            f"Tel: {u_r.get('TELEFONE')}"
-                        )
+                    if row_idx:
+                        senha_temp = gerar_senha_temp(10)
+                        expira_dt = _br_now() + timedelta(minutes=10)
+                        expira_str = _fmt_dt(expira_dt)
+
+                        temp_cols = ensure_temp_cols(sheet_u_escrita)
+                        gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_SENHA"], senha_temp)
+                        gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_EXPIRA"], expira_str)
+                        gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "NAO")
+
+                        buscar_usuarios_cadastrados.clear()
+                        buscar_usuarios_admin.clear()
+
+                        st.success("✅ Senha temporária gerada com sucesso.")
+                        st.info(f"🔑 **Senha temporária:** `{senha_temp}`\n\n⏳ Expira em: {expira_str}\n\n⚠️ Válida para **apenas 1 acesso**.")
                     else:
                         st.error("Dados não encontrados (verifique e-mail e telefone).")
 
@@ -757,6 +896,50 @@ try:
     # =========================================
     else:
         u = st.session_state.usuario_logado
+
+        # ==========================================================
+        # FORÇAR TROCA DE SENHA APÓS LOGIN COM SENHA TEMPORÁRIA
+        # ==========================================================
+        if st.session_state.get("_force_password_change", False):
+            st.warning("🔐 Você entrou com uma **senha temporária**. Defina agora uma **nova senha** para concluir o acesso.")
+            with st.form("form_troca_senha_temp"):
+                nova1 = st.text_input("Nova senha:", type="password")
+                nova2 = st.text_input("Confirmar nova senha:", type="password")
+                ok_btn = st.form_submit_button("💾 SALVAR NOVA SENHA", use_container_width=True)
+
+            if ok_btn:
+                if not str(nova1 or "").strip():
+                    st.error("Informe a nova senha.")
+                elif nova1 != nova2:
+                    st.error("As senhas não conferem.")
+                else:
+                    try:
+                        row_idx = st.session_state.get("_pwd_change_row")
+                        if row_idx is None:
+                            row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, u.get("Email", ""), u.get("TELEFONE", ""))
+                        if row_idx:
+                            gs_call(sheet_u_escrita.update_cell, row_idx, 4, str(nova1))
+                            temp_cols = ensure_temp_cols(sheet_u_escrita)
+                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_SENHA"], "")
+                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_EXPIRA"], "")
+                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
+
+                            buscar_usuarios_cadastrados.clear()
+                            buscar_usuarios_admin.clear()
+
+                            st.session_state.usuario_logado["Senha"] = str(nova1)
+                            st.session_state._force_password_change = False
+                            st.session_state._pwd_change_row = None
+                            st.session_state._login_kind = "REAL"
+                            st.success("✅ Senha atualizada. Você já pode usar o sistema normalmente.")
+                            st.rerun()
+                        else:
+                            st.error("Não foi possível localizar seu usuário na planilha para atualizar a senha.")
+                    except Exception as ex:
+                        st.error(f"Falha ao atualizar senha: {ex}")
+
+            st.stop()
+
 
         st.sidebar.markdown("### 👤 Usuário Conectado 🙍‍♂️")
         st.sidebar.info(f"**{u.get('Graduação')} {u.get('Nome')}**")
@@ -900,5 +1083,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
