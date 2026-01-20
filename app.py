@@ -89,7 +89,6 @@ def gs_call(func, *args, **kwargs):
 # CONEXÕES (CACHE_RESOURCE)
 # ==========================================================
 @st.cache_resource
-@st.cache_resource
 def conectar_gsheets():
     info = dict(st.secrets["gcp_service_account"])
 
@@ -305,8 +304,6 @@ def verificar_status_e_limpar(sheet_p, dados_p):
         except Exception:
             pass
 
-    is_aberto = False
-
     # Regras de abertura/fechamento:
     # - SEG a QUI: fecha apenas nas janelas 05:00-07:00 e 17:00-19:00
     # - SEX: fecha às 17:00 e só reabre DOM às 19:00 (portanto SEX após 17:00 fica fechado)
@@ -337,20 +334,6 @@ def verificar_status_e_limpar(sheet_p, dados_p):
 # CICLO (exibição abaixo do título)
 # ==========================================================
 def obter_ciclo_atual():
-    """
-    Regras do ciclo (texto informativo):
-    - SEG a QUI:
-        * Se agora >= 19:00 -> inscrições são para 06:30 de amanhã
-        * Se agora < 07:00  -> inscrições são para 06:30 de hoje
-        * Se 07:00 <= agora < 19:00 -> inscrições são para 18:30 de hoje
-    - SEX:
-        * Até 16:59 segue regra normal acima
-        * A partir de 17:00 fecha e o próximo ciclo será 06:30 de SEGUNDA
-    - SÁB: fechado; próximo ciclo será 06:30 de SEGUNDA
-    - DOM:
-        * Antes de 19:00 fechado; próximo ciclo será 06:30 de SEGUNDA
-        * A partir de 19:00 aberto; inscrições são para 06:30 de amanhã (SEGUNDA)
-    """
     agora = datetime.now(FUSO_BR)
     t = agora.time()
     wd = agora.weekday()
@@ -581,6 +564,7 @@ try:
     records_u_public = buscar_usuarios_cadastrados()
     limite_max = buscar_limite_dinamico()
     sheet_u_escrita = ws_usuarios()
+
     # Garante colunas TEMP_* para recuperação segura
     try:
         ensure_temp_cols(sheet_u_escrita)
@@ -639,15 +623,15 @@ try:
                              and _senha_confere(u, l_s)[1]),
                             None
                         )
-                        
+
                         if u_a:
-                        
                             status_user = str(u_a.get("STATUS", "")).strip().upper()
                             if status_user == "ATIVO":
-                                kind, ok = _senha_confere(u_a, l_s)
+                                kind, _ok = _senha_confere(u_a, l_s)
                                 st.session_state.usuario_logado = u_a
                                 st.session_state._login_kind = kind
 
+                                # Se entrou com TEMP -> marca como usada e força troca de senha
                                 if kind == "TEMP":
                                     try:
                                         temp_cols = ensure_temp_cols(sheet_u_escrita)
@@ -663,8 +647,6 @@ try:
                                         st.session_state._pwd_change_row = None
 
                                 st.rerun()
-                            else:
-                                st.error("Acesso negado. Aguardando aprovação do Administrador.")
                             else:
                                 st.error("Acesso negado. Aguardando aprovação do Administrador.")
                         else:
@@ -1090,5 +1072,6 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
 
 
