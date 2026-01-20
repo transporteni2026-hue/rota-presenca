@@ -89,11 +89,15 @@ def gs_call(func, *args, **kwargs):
 # CONEXÕES (CACHE_RESOURCE)
 # ==========================================================
 @st.cache_resource
+@st.cache_resource
 def conectar_gsheets():
     info = dict(st.secrets["gcp_service_account"])
-    # Correção crítica (Streamlit Secrets pode vir com \n)
-if "private_key" in info and isinstance(info["private_key"], str):
-    info["private_key"] = info["private_key"].replace("\\n", "\n")
+
+    # O Streamlit Secrets às vezes guarda a chave com "\\n" literal
+    pk = info.get("private_key")
+    if isinstance(pk, str):
+        info["private_key"] = pk.replace("\\n", "\n")
+
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -634,7 +638,10 @@ try:
                              and tel_only_digits(u.get("TELEFONE", "")) == tel_login_digits
                              and _senha_confere(u, l_s)[1]),
                             None
-                        )if u_a:
+                        )
+                        
+                        if u_a:
+                        
                             status_user = str(u_a.get("STATUS", "")).strip().upper()
                             if status_user == "ATIVO":
                                 kind, ok = _senha_confere(u_a, l_s)
@@ -1083,4 +1090,5 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
 
