@@ -92,8 +92,8 @@ def gs_call(func, *args, **kwargs):
 def conectar_gsheets():
     info = dict(st.secrets["gcp_service_account"])
     # Correção crítica (Streamlit Secrets pode vir com \n)
-    if \"private_key\" in info and isinstance(info[\"private_key\"], str):
-        info[\"private_key\"] = info[\"private_key\"].replace(\"\\n\", \"\n\")
+if "private_key" in info and isinstance(info["private_key"], str):
+    info["private_key"] = info["private_key"].replace("\\n", "\n")
     creds = Credentials.from_service_account_info(info, scopes=scope)
     return gspread.authorize(creds)
 
@@ -1083,3 +1083,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
