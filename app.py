@@ -208,7 +208,6 @@ def find_user_row_by_email_tel(sheet_u, email: str, tel_digits: str):
     return None, None
 
 
-
 # ==========================================================
 # LEITURAS (CACHE_DATA)
 # ==========================================================
@@ -541,10 +540,13 @@ if "usuario_logado" not in st.session_state:
     st.session_state.usuario_logado = None
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
-if "_force_password_change" not in st.session_state:
-    st.session_state._force_password_change = False
-if "_pwd_change_row" not in st.session_state:
-    st.session_state._pwd_change_row = None
+
+# (antes era _force_password_change; agora existe o novo fluxo de atualização completa)
+if "_force_profile_update" not in st.session_state:
+    st.session_state._force_profile_update = False
+if "_profile_update_row" not in st.session_state:
+    st.session_state._profile_update_row = None
+
 if "_login_kind" not in st.session_state:
     st.session_state._login_kind = ""
 if "conf_ativa" not in st.session_state:
@@ -557,7 +559,6 @@ if "_tel_login_fmt" not in st.session_state:
     st.session_state._tel_login_fmt = ""
 if "_tel_cad_fmt" not in st.session_state:
     st.session_state._tel_cad_fmt = ""
-
 
 try:
     # Leitura leve pro público
@@ -631,20 +632,18 @@ try:
                                 st.session_state.usuario_logado = u_a
                                 st.session_state._login_kind = kind
 
-                                # Se entrou com TEMP -> marca como usada e força troca de senha
+                                # ==========================================================
+                                # NOVO: Se entrou com TEMP -> força ATUALIZAÇÃO COMPLETA DO CADASTRO
+                                # (tudo pode mudar, EXCETO email)
+                                # ==========================================================
                                 if kind == "TEMP":
                                     try:
-                                        temp_cols = ensure_temp_cols(sheet_u_escrita)
-                                        row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, l_e, tel_login_digits)
-                                        if row_idx:
-                                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
-                                            buscar_usuarios_cadastrados.clear()
-                                            buscar_usuarios_admin.clear()
-                                            st.session_state._force_password_change = True
-                                            st.session_state._pwd_change_row = row_idx
+                                        row_idx, _d = find_user_row_by_email_tel(sheet_u_escrita, l_e, tel_login_digits)
+                                        st.session_state._force_profile_update = True
+                                        st.session_state._profile_update_row = row_idx
                                     except Exception:
-                                        st.session_state._force_password_change = True
-                                        st.session_state._pwd_change_row = None
+                                        st.session_state._force_profile_update = True
+                                        st.session_state._profile_update_row = None
 
                                 st.rerun()
                             else:
@@ -674,7 +673,6 @@ try:
                     if cadastrou:
                         # ==========================================================
                         # OBRIGATÓRIO: todos os campos do CADASTRO
-                        # (alteração solicitada)
                         # ==========================================================
                         def norm_str(x):
                             return str(x or "").strip()
@@ -704,7 +702,6 @@ try:
                         else:
                             # ==========================================================
                             # BLOQUEAR CADASTRO SE EMAIL OU TELEFONE JÁ EXISTIREM
-                            # (alteração solicitada)
                             # ==========================================================
                             novo_email = norm_str(n_e).lower()
                             novo_tel_digits = tel_only_digits(fmt_tel_cad)
@@ -749,7 +746,7 @@ try:
             * **Manhã:** Inscrições abertas até às 05:00h. Reabre às 07:00h.
             * **Tarde:** Inscrições abertas até às 17:00h. Reabre às 19:00h.
             * **Finais de Semana:** Abrem domingo às 19:00h.
-            
+
             **2. Observação:**
             * Nos períodos em que a lista ficar suspensa para conferência (05:00h às 07:00h / 17:00h às 19:00h), os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
             * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Sendo assim, caso queira manter um histórico de viagem, antes desses horários, faça o download do pdf e/ou do resumo do W.Zap.
@@ -790,6 +787,7 @@ try:
 
                         st.success("✅ Senha temporária gerada com sucesso.")
                         st.info(f"🔑 **Senha temporária:** `{senha_temp}`\n\n⏳ Expira em: {expira_str}\n\n⚠️ Válida para **apenas 1 acesso**.")
+                        st.caption("Após entrar com a senha temporária, você será obrigado a atualizar seu cadastro (exceto e-mail).")
                     else:
                         st.error("Dados não encontrados (verifique e-mail e telefone).")
 
@@ -887,45 +885,136 @@ try:
         u = st.session_state.usuario_logado
 
         # ==========================================================
-        # FORÇAR TROCA DE SENHA APÓS LOGIN COM SENHA TEMPORÁRIA
+        # NOVO: FORÇAR ATUALIZAÇÃO COMPLETA DO CADASTRO APÓS LOGIN COM SENHA TEMP
+        # (e-mail NÃO pode ser alterado)
         # ==========================================================
-        if st.session_state.get("_force_password_change", False):
-            st.warning("🔐 Você entrou com uma **senha temporária**. Defina agora uma **nova senha** para concluir o acesso.")
-            with st.form("form_troca_senha_temp"):
+        if st.session_state.get("_force_profile_update", False):
+            st.warning("🔐 Você entrou com uma **senha temporária**. Atualize agora seu **cadastro completo** (o e-mail não pode ser alterado).")
+
+            # tenta localizar linha
+            row_idx = st.session_state.get("_profile_update_row")
+            if row_idx is None:
+                try:
+                    row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, u.get("Email", ""), u.get("TELEFONE", ""))
+                except Exception:
+                    row_idx = None
+
+            # Pré-preenche com dados atuais
+            nome_atual = str(u.get("Nome", "") or "")
+            grad_atual = str(u.get("Graduação", "") or "SD")
+            lot_atual = str(u.get("Lotação", "") or "")
+            orig_atual = str(u.get("QG_RMCF_OUTROS", "") or u.get("ORIGEM", "") or "QG")
+            tel_atual_fmt = tel_format_br(str(u.get("TELEFONE", "") or ""))
+
+            grads = ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"]
+            origs = ["QG", "RMCF", "OUTROS"]
+
+            try:
+                grad_idx = grads.index(str(grad_atual).strip()) if str(grad_atual).strip() in grads else grads.index("SD")
+            except Exception:
+                grad_idx = grads.index("SD")
+
+            try:
+                orig_idx = origs.index(str(orig_atual).strip().upper()) if str(orig_atual).strip().upper() in origs else origs.index("QG")
+            except Exception:
+                orig_idx = origs.index("QG")
+
+            with st.form("form_atualizar_cadastro_temp"):
+                st.text_input("E-mail (não pode alterar):", value=str(u.get("Email", "") or ""), disabled=True)
+
+                novo_nome = st.text_input("Nome de Escala:", value=nome_atual)
+                novo_grad = st.selectbox("Graduação:", grads, index=grad_idx)
+                novo_lot = st.text_input("Lotação:", value=lot_atual)
+
+                raw_tel_up = st.text_input("Telefone:", value=st.session_state.get("_tel_up_fmt", tel_atual_fmt))
+                fmt_tel_up = tel_format_br(raw_tel_up)
+                st.session_state["_tel_up_fmt"] = fmt_tel_up
+
+                novo_orig = st.selectbox("Origem:", origs, index=orig_idx)
+
+                st.markdown("#### 🔑 Nova senha")
                 nova1 = st.text_input("Nova senha:", type="password")
                 nova2 = st.text_input("Confirmar nova senha:", type="password")
-                ok_btn = st.form_submit_button("💾 SALVAR NOVA SENHA", use_container_width=True)
+
+                ok_btn = st.form_submit_button("💾 SALVAR ATUALIZAÇÃO", use_container_width=True)
 
             if ok_btn:
-                if not str(nova1 or "").strip():
-                    st.error("Informe a nova senha.")
+                def norm_str(x):
+                    return str(x or "").strip()
+
+                n_ok = bool(norm_str(novo_nome))
+                l_ok = bool(norm_str(novo_lot))
+                p_ok = bool(norm_str(nova1))
+
+                missing = []
+                if not n_ok: missing.append("Nome de Escala")
+                if not tel_is_valid_11(fmt_tel_up): missing.append("Telefone (inválido)")
+                if not norm_str(novo_grad): missing.append("Graduação")
+                if not l_ok: missing.append("Lotação")
+                if not norm_str(novo_orig): missing.append("Origem")
+                if not p_ok: missing.append("Nova senha")
+
+                if missing:
+                    st.error("Preencha corretamente: " + ", ".join(missing) + ".")
                 elif nova1 != nova2:
                     st.error("As senhas não conferem.")
                 else:
                     try:
-                        row_idx = st.session_state.get("_pwd_change_row")
-                        if row_idx is None:
-                            row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, u.get("Email", ""), u.get("TELEFONE", ""))
-                        if row_idx:
-                            gs_call(sheet_u_escrita.update_cell, row_idx, 4, str(nova1))
-                            temp_cols = ensure_temp_cols(sheet_u_escrita)
-                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_SENHA"], "")
-                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_EXPIRA"], "")
-                            gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
-
-                            buscar_usuarios_cadastrados.clear()
-                            buscar_usuarios_admin.clear()
-
-                            st.session_state.usuario_logado["Senha"] = str(nova1)
-                            st.session_state._force_password_change = False
-                            st.session_state._pwd_change_row = None
-                            st.session_state._login_kind = "REAL"
-                            st.success("✅ Senha atualizada. Você já pode usar o sistema normalmente.")
-                            st.rerun()
+                        if not row_idx:
+                            st.error("Não foi possível localizar seu usuário na planilha para atualizar o cadastro.")
                         else:
-                            st.error("Não foi possível localizar seu usuário na planilha para atualizar a senha.")
+                            # Regra: telefone não pode colidir com outro usuário (exceto ele mesmo)
+                            tel_new_digits = tel_only_digits(fmt_tel_up)
+                            email_log = str(u.get("Email", "")).strip().lower()
+
+                            # busca registros mais recentes para validar duplicidade
+                            records_check = buscar_usuarios_cadastrados()
+                            tel_colide = False
+                            for uu in records_check:
+                                em2 = str(uu.get("Email", "")).strip().lower()
+                                if em2 == email_log:
+                                    continue
+                                if tel_only_digits(uu.get("TELEFONE", "")) == tel_new_digits:
+                                    tel_colide = True
+                                    break
+
+                            if tel_colide:
+                                st.error("Este telefone já está cadastrado para outro usuário.")
+                            else:
+                                # Atualiza colunas no layout do seu append_row:
+                                # 1 Nome | 2 Graduação | 3 Lotação | 4 Senha | 5 Origem | 6 Email | 7 Telefone | 8 STATUS
+                                gs_call(sheet_u_escrita.update_cell, row_idx, 1, norm_str(novo_nome))
+                                gs_call(sheet_u_escrita.update_cell, row_idx, 2, norm_str(novo_grad))
+                                gs_call(sheet_u_escrita.update_cell, row_idx, 3, norm_str(novo_lot))
+                                gs_call(sheet_u_escrita.update_cell, row_idx, 4, norm_str(nova1))
+                                gs_call(sheet_u_escrita.update_cell, row_idx, 5, norm_str(novo_orig))
+                                gs_call(sheet_u_escrita.update_cell, row_idx, 7, fmt_tel_up)
+
+                                # Finaliza token TEMP: marca como usado e limpa
+                                temp_cols = ensure_temp_cols(sheet_u_escrita)
+                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_SENHA"], "")
+                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_EXPIRA"], "")
+                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
+
+                                buscar_usuarios_cadastrados.clear()
+                                buscar_usuarios_admin.clear()
+
+                                # Atualiza sessão local
+                                st.session_state.usuario_logado["Nome"] = norm_str(novo_nome)
+                                st.session_state.usuario_logado["Graduação"] = norm_str(novo_grad)
+                                st.session_state.usuario_logado["Lotação"] = norm_str(novo_lot)
+                                st.session_state.usuario_logado["Senha"] = norm_str(nova1)
+                                st.session_state.usuario_logado["QG_RMCF_OUTROS"] = norm_str(novo_orig)
+                                st.session_state.usuario_logado["TELEFONE"] = fmt_tel_up
+
+                                st.session_state._force_profile_update = False
+                                st.session_state._profile_update_row = None
+                                st.session_state._login_kind = "REAL"
+
+                                st.success("✅ Cadastro atualizado. Você já pode usar o sistema normalmente.")
+                                st.rerun()
                     except Exception as ex:
-                        st.error(f"Falha ao atualizar senha: {ex}")
+                        st.error(f"Falha ao atualizar cadastro: {ex}")
 
             st.stop()
 
@@ -994,7 +1083,6 @@ try:
 
             # ==========================================================
             # ATUALIZAR DISPONÍVEL MESMO COM LISTA FECHADA
-            # (alteração solicitada)
             # ==========================================================
             up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True)
             if up_btn_fechado:
@@ -1058,7 +1146,7 @@ try:
     st.markdown('<div class="footer">Desenvolvido por: <b>MAJ ANDRÉ AGUIAR - CAES®️</b></div>', unsafe_allow_html=True)
 
     # ==========================================================
-    # GIF NO FINAL DA PÁGINA (alteração solicitada)
+    # GIF NO FINAL DA PÁGINA
     #  - 20% menor => width:80%
     # ==========================================================
     st.markdown(
@@ -1072,7 +1160,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
-
-
