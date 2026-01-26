@@ -1135,7 +1135,7 @@ try:
             with c2:
                 txt_w = "*🚌 LISTA DE PRESENÇA*\n\n"
                 for _, r in df_o.iterrows():
-                    txt_w += f"{r['Nº']}. {r['GRADUAÇÃO']} {r['NOME']}\n"
+                    txt_w += f"{r['Nº']}. {r['GRADUAÇÃO']} {r['NOME']} - {r['LOTAÇÃO']}\n"
                 st.markdown(
                     f'<a href="https://wa.me/?text={urllib.parse.quote(txt_w)}" target="_blank">'
                     f"<button style='width:100%; height:38px; background-color:#25D366; color:white; border:none; "
@@ -1160,5 +1160,6 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
 
 
