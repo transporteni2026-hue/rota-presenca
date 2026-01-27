@@ -736,7 +736,7 @@ try:
             st.success("📲 **COMO INSTALAR (TELA INICIAL)**")
             st.markdown("**No Chrome (Android):** Toque nos 3 pontos (⋮) e em 'Instalar Aplicativo'.")
             st.markdown("**No Safari (iPhone):** Toque em Compartilhar (⬆️) e em 'Adicionar à Tela de Início'.")
-            st.markdown("**No Telegram:** Procure o bot `@RotaNovaIguacuBot` e toque no botão 'Abrir App Rota' no menu.")
+            st.markdown("**No Telegram:** Procure o bot @RotaNovaIguacuBot e toque no botão 'Abrir App Rota' no menu.")
             st.markdown("**QR CODE:** https://drive.google.com/file/d/1ALXgvt44vGWiGaW7HAfwYHfx-I_Dbgjq/view?usp=sharing")
             st.markdown("**LINK PARA NAVEGADOR:** https://rota-presenca-5hcorx5wezfaezztkehwol.streamlit.app/")
             st.divider()
@@ -786,7 +786,7 @@ try:
                         buscar_usuarios_admin.clear()
 
                         st.success("✅ Senha temporária gerada com sucesso.")
-                        st.info(f"🔑 **Senha temporária:** `{senha_temp}`\n\n⏳ Expira em: {expira_str}\n\n⚠️ Válida para **apenas 1 acesso**.")
+                        st.info(f"🔑 **Senha temporária:** {senha_temp}\n\n⏳ Expira em: {expira_str}\n\n⚠️ Válida para **apenas 1 acesso**.")
                         st.caption("Após entrar com a senha temporária, você será obrigado a atualizar seu cadastro (exceto e-mail).")
                     else:
                         st.error("Dados não encontrados (verifique e-mail e telefone).")
@@ -1084,7 +1084,7 @@ try:
             # ==========================================================
             # ATUALIZAR DISPONÍVEL MESMO COM LISTA FECHADA
             # ==========================================================
-            up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True)
+            up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True, key="up_btn_fechado")
             if up_btn_fechado:
                 buscar_presenca_atualizada.clear()
                 st.rerun()
@@ -1109,7 +1109,7 @@ try:
 
             c_up1, c_up2 = st.columns([1, 1])
             with c_up1:
-                up_btn = st.button("🔄 ATUALIZAR", use_container_width=True)
+                up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="up_btn_tabela")
                 if up_btn:
                     buscar_presenca_atualizada.clear()
                     st.rerun()
@@ -1160,6 +1160,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
-
