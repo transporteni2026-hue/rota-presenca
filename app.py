@@ -560,6 +560,12 @@ if "_tel_login_fmt" not in st.session_state:
 if "_tel_cad_fmt" not in st.session_state:
     st.session_state._tel_cad_fmt = ""
 
+# ==========================================================
+# NOVO (somente para confirmar exclusão da presença)
+# ==========================================================
+if "_confirmar_exclusao_presenca" not in st.session_state:
+    st.session_state._confirmar_exclusao_presenca = False
+
 try:
     # Leitura leve pro público
     records_u_public = buscar_usuarios_cadastrados()
@@ -1054,15 +1060,42 @@ try:
 
         if ja:
             st.success(f"✅ Presença registrada: {pos}º")
-            exc_btn = st.button("❌ EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True)
+
+            # ==========================================================
+            # ALTERAÇÃO SOLICITADA: confirmação antes de excluir
+            # ==========================================================
+            exc_btn = st.button("❌ EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_presenca")
             if exc_btn:
-                email_logado = str(u.get("Email")).strip().lower()
-                if dados_p and len(dados_p) > 1:
-                    for idx, r in enumerate(dados_p):
-                        if len(r) >= 6 and str(r[5]).strip().lower() == email_logado:
-                            gs_call(sheet_p_escrita.delete_rows, idx + 1)
-                            buscar_presenca_atualizada.clear()
-                            st.rerun()
+                st.session_state._confirmar_exclusao_presenca = True
+                st.rerun()
+
+            if st.session_state._confirmar_exclusao_presenca:
+                st.warning("⚠️ Você realmente deseja **excluir sua presença**?")
+
+                c_sim, c_nao, c_cancelar = st.columns(3)
+
+                with c_sim:
+                    sim_btn = st.button("✅ SIM", use_container_width=True, key="btn_confirmar_exclusao_sim")
+                with c_nao:
+                    nao_btn = st.button("❌ NÃO", use_container_width=True, key="btn_confirmar_exclusao_nao")
+                with c_cancelar:
+                    cancel_btn = st.button("🚫 CANCELAR", use_container_width=True, key="btn_confirmar_exclusao_cancelar")
+
+                if nao_btn or cancel_btn:
+                    st.session_state._confirmar_exclusao_presenca = False
+                    st.rerun()
+
+                if sim_btn:
+                    email_logado = str(u.get("Email")).strip().lower()
+                    if dados_p and len(dados_p) > 1:
+                        for idx, r in enumerate(dados_p):
+                            if len(r) >= 6 and str(r[5]).strip().lower() == email_logado:
+                                gs_call(sheet_p_escrita.delete_rows, idx + 1)
+                                break
+
+                    st.session_state._confirmar_exclusao_presenca = False
+                    buscar_presenca_atualizada.clear()
+                    st.rerun()
 
         elif aberto:
             salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True)
