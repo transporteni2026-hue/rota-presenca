@@ -527,6 +527,13 @@ st.markdown("""
     table { width: 100% !important; font-size: 10px; table-layout: fixed; border-collapse: collapse; }
     th, td { text-align: center; padding: 2px !important; white-space: normal !important; word-wrap: break-word; }
     .footer { text-align: center; font-size: 11px; color: #888; margin-top: 40px; padding: 10px; border-top: 1px solid #eee; }
+
+    /* ======================================================
+       ALTERAÇÃO SOLICITADA (TELA): LINHAS ALTERNADAS (ZEBRA)
+       - aplica somente na tabela de presença (classe abaixo)
+       ====================================================== */
+    table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
+    table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1149,8 +1156,19 @@ try:
             with c_up2:
                 st.caption("Atualiza sob demanda.")
 
+            # ==========================================================
+            # ALTERAÇÃO SOLICITADA (TELA):
+            # 1) Zebra (linhas alternadas) via CSS na classe 'presenca-zebra'
+            # 2) Nome em negrito (coluna NOME) sem quebrar excedentes (span vermelho)
+            # ==========================================================
+            df_v_show = df_v.copy()
+            if "NOME" in df_v_show.columns:
+                df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<b>{x}</b>")
+
             st.write(
-                f"<div class='tabela-responsiva'>{df_v.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False)}</div>",
+                f"<div class='tabela-responsiva'>"
+                f"{df_v_show.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
+                f"</div>",
                 unsafe_allow_html=True
             )
 
