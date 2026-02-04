@@ -1130,7 +1130,7 @@ try:
                 st.rerun()
 
         # CONFERÊNCIA
-        if ja and pos <= 3 and janela_conf:
+        if ja and janela_conf:
             st.divider()
             st.subheader("📋 LISTA DE EMBARQUE 📋")
             painel_btn = st.button("✍️ CONFERÊNCIA ✍️", use_container_width=True)
@@ -1211,3 +1211,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
