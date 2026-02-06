@@ -515,6 +515,37 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
 # INTERFACE
 # ==========================================================
 st.set_page_config(page_title="Rota Nova Iguaçu", layout="centered")
+
+# ==========================================================
+# ALTERAÇÃO SOLICITADA: ZOOM COM PINÇA E RESET
+# ==========================================================
+st.markdown("""
+    <script>
+        // Permite o zoom na meta tag do viewport
+        var viewport = window.parent.document.querySelector('meta[name="viewport"]');
+        if (viewport) {
+            viewport.content = "width=device-width, initial-scale=1.0, user-scalable=yes";
+        }
+
+        // Listener para detectar quando o usuário para de tocar na tela (solta a pinça)
+        window.parent.document.addEventListener('touchend', function(event) {
+            // Pequeno delay para garantir que o gesto de pinça terminou
+            setTimeout(function() {
+                if (window.parent.visualViewport.scale !== 1) {
+                    // Reseta o zoom para 1.0 (tamanho normal)
+                    // Nota: Alguns navegadores mobile podem restringir o reset automático por segurança.
+                    // Esta técnica tenta forçar o retorno à escala original.
+                    var viewport = window.parent.document.querySelector('meta[name="viewport"]');
+                    viewport.content = "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no";
+                    setTimeout(function() {
+                        viewport.content = "width=device-width, initial-scale=1.0, user-scalable=yes";
+                    }, 50);
+                }
+            }, 300);
+        });
+    </script>
+""", unsafe_allow_html=True)
+
 st.markdown('<script src="https://telegram.org/js/telegram-web-app.js"></script>', unsafe_allow_html=True)
 
 st.markdown("""
@@ -1211,4 +1242,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
