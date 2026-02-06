@@ -517,23 +517,148 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
 st.set_page_config(page_title="Rota Nova Iguaçu", layout="centered")
 st.markdown('<script src="https://telegram.org/js/telegram-web-app.js"></script>', unsafe_allow_html=True)
 
+# ==========================================================
+# ALTERAÇÃO SOLICITADA (PINÇA NO APP INSTALADO):
+# Zoom por pinça (2 dedos) aplicado SOMENTE na tabela.
+# - Funciona mesmo se o PWA bloquear zoom do navegador.
+# - Duplo toque reseta.
+# - Salva escala em localStorage.
+# ==========================================================
+st.markdown("""
+<script>
+(function() {
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+  function applyScale(target, scale){
+    if(!target) return;
+    target.style.transformOrigin = "0 0";
+    target.style.transform = "scale(" + scale.toFixed(3) + ")";
+    // Para não cortar após scale, ajusta largura "inversa"
+    target.style.width = (100/scale).toFixed(3) + "%";
+    try { localStorage.setItem("PRESENCA_ZOOM_SCALE", String(scale)); } catch(e){}
+  }
+
+  function getSavedScale(){
+    try {
+      var s = parseFloat(localStorage.getItem("PRESENCA_ZOOM_SCALE") || "1");
+      if(!isFinite(s)) s = 1;
+      return clamp(s, 0.8, 2.5);
+    } catch(e) { return 1; }
+  }
+
+  function initWhenReady(){
+    var wrap = document.getElementById("zoom_wrap");
+    var target = document.getElementById("zoom_target");
+    if(!wrap || !target){
+      setTimeout(initWhenReady, 250);
+      return;
+    }
+
+    // aplica escala salva
+    applyScale(target, getSavedScale());
+
+    // evita o navegador tratar como zoom de página (quando permitido)
+    wrap.style.touchAction = "pan-x pan-y";
+
+    var startDist = 0;
+    var startScale = getSavedScale();
+    var active = false;
+
+    function dist(t1, t2){
+      var dx = (t1.clientX - t2.clientX);
+      var dy = (t1.clientY - t2.clientY);
+      return Math.sqrt(dx*dx + dy*dy);
+    }
+
+    wrap.addEventListener("touchstart", function(e){
+      if(e.touches && e.touches.length === 2){
+        active = true;
+        startDist = dist(e.touches[0], e.touches[1]);
+        startScale = getSavedScale();
+      }
+    }, {passive:true});
+
+    wrap.addEventListener("touchmove", function(e){
+      if(!active) return;
+      if(!(e.touches && e.touches.length === 2)) return;
+      var d = dist(e.touches[0], e.touches[1]);
+      if(startDist <= 0) return;
+      var factor = d / startDist;
+      var newScale = clamp(startScale * factor, 0.8, 2.5);
+      applyScale(target, newScale);
+      // não usamos preventDefault para evitar travar scroll em alguns Samsung,
+      // e como é transform local, costuma funcionar mesmo assim.
+    }, {passive:true});
+
+    wrap.addEventListener("touchend", function(e){
+      if(!e.touches || e.touches.length < 2){
+        active = false;
+      }
+    }, {passive:true});
+
+    // duplo toque para resetar
+    var lastTap = 0;
+    wrap.addEventListener("touchend", function(e){
+      var now = Date.now();
+      if(now - lastTap < 300){
+        applyScale(target, 1.0);
+      }
+      lastTap = now;
+    }, {passive:true});
+
+    // suporte a botões (se existirem)
+    window.__PRESENCA_ZOOM__ = {
+      set: function(s){ applyScale(target, clamp(s,0.8,2.5)); },
+      get: function(){ return getSavedScale(); }
+    };
+  }
+
+  initWhenReady();
+})();
+</script>
+""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
     .titulo-container { text-align: center; width: 100%; }
     .titulo-responsivo { font-size: clamp(1.2rem, 5vw, 2.2rem); font-weight: bold; margin-bottom: 6px; }
     .subtitulo-ciclo { text-align:center; font-size: 0.95rem; color: #444; margin-bottom: 16px; }
     .stCheckbox { background-color: #f8f9fa; padding: 5px; border-radius: 4px; border: 1px solid #eee; }
-    .tabela-responsiva { width: 100%; overflow-x: auto; }
+
+    .tabela-responsiva { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
     table { width: 100% !important; font-size: 10px; table-layout: fixed; border-collapse: collapse; }
     th, td { text-align: center; padding: 2px !important; white-space: normal !important; word-wrap: break-word; }
     .footer { text-align: center; font-size: 11px; color: #888; margin-top: 40px; padding: 10px; border-top: 1px solid #eee; }
 
     /* ======================================================
        ALTERAÇÃO SOLICITADA (TELA): LINHAS ALTERNADAS (ZEBRA)
-       - aplica somente na tabela de presença (classe abaixo)
        ====================================================== */
     table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
     table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
+
+    /* ======================================================
+       NOVO: área do zoom por pinça
+       ====================================================== */
+    #zoom_wrap{
+        width:100%;
+        overflow:auto;
+        -webkit-overflow-scrolling: touch;
+        border: 1px solid #eee;
+        border-radius: 8px;
+        padding: 6px;
+        background: #fff;
+    }
+    #zoom_target{
+        will-change: transform;
+    }
+    .zoom-hint{
+        font-size: 12px;
+        color: #555;
+        text-align:center;
+        margin-top: 6px;
+        margin-bottom: 6px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1160,15 +1285,32 @@ try:
             # ALTERAÇÃO SOLICITADA (TELA):
             # 1) Zebra (linhas alternadas) via CSS na classe 'presenca-zebra'
             # 2) Nome em negrito (coluna NOME) sem quebrar excedentes (span vermelho)
+            # 3) NOVO: PINÇA PARA ZOOM NA TABELA (PWA Samsung)
             # ==========================================================
             df_v_show = df_v.copy()
             if "NOME" in df_v_show.columns:
                 df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<b>{x}</b>")
 
+            # Controles opcionais (ajudam se o usuário preferir botão):
+            z1, z2, z3 = st.columns([1, 2, 1])
+            with z1:
+                if st.button("➖", use_container_width=True, key="zoom_minus_btn"):
+                    st.markdown("<script>try{__PRESENCA_ZOOM__.set(__PRESENCA_ZOOM__.get()-0.1);}catch(e){}</script>", unsafe_allow_html=True)
+            with z2:
+                if st.button("🔎 Reset (duplo toque também)", use_container_width=True, key="zoom_reset_btn"):
+                    st.markdown("<script>try{__PRESENCA_ZOOM__.set(1.0);}catch(e){}</script>", unsafe_allow_html=True)
+            with z3:
+                if st.button("➕", use_container_width=True, key="zoom_plus_btn"):
+                    st.markdown("<script>try{__PRESENCA_ZOOM__.set(__PRESENCA_ZOOM__.get()+0.1);}catch(e){}</script>", unsafe_allow_html=True)
+
+            st.markdown("<div class='zoom-hint'>📌 Use <b>dois dedos</b> na tabela para <b>ampliar</b>. (Duplo toque: reset)</div>", unsafe_allow_html=True)
+
             st.write(
-                f"<div class='tabela-responsiva'>"
+                "<div id='zoom_wrap'>"
+                "<div id='zoom_target'>"
                 f"{df_v_show.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
-                f"</div>",
+                "</div>"
+                "</div>",
                 unsafe_allow_html=True
             )
 
@@ -1211,5 +1353,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
