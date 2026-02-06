@@ -515,6 +515,37 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
 # INTERFACE
 # ==========================================================
 st.set_page_config(page_title="Rota Nova Iguaçu", layout="centered")
+
+# ==========================================================
+# ALTERAÇÃO SOLICITADA:
+# Habilitar "pinça para zoom" (user-scalable=yes) no celular
+# - Funciona no Chrome/Android, Safari/iPhone e também melhora em WebView (Telegram).
+# - Se já existir meta viewport, ele sobrescreve o content.
+# ==========================================================
+st.markdown(
+    """
+<script>
+(function() {
+  try {
+    var desired = "width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes";
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (!meta) {
+      meta = document.createElement('meta');
+      meta.setAttribute('name', 'viewport');
+      document.head.appendChild(meta);
+    }
+    meta.setAttribute('content', desired);
+
+    // Em alguns WebViews, também ajuda liberar gestos:
+    document.documentElement.style.touchAction = "pan-x pan-y";
+    document.body.style.touchAction = "pan-x pan-y";
+  } catch (e) {}
+})();
+</script>
+""",
+    unsafe_allow_html=True
+)
+
 st.markdown('<script src="https://telegram.org/js/telegram-web-app.js"></script>', unsafe_allow_html=True)
 
 st.markdown("""
@@ -523,7 +554,8 @@ st.markdown("""
     .titulo-responsivo { font-size: clamp(1.2rem, 5vw, 2.2rem); font-weight: bold; margin-bottom: 6px; }
     .subtitulo-ciclo { text-align:center; font-size: 0.95rem; color: #444; margin-bottom: 16px; }
     .stCheckbox { background-color: #f8f9fa; padding: 5px; border-radius: 4px; border: 1px solid #eee; }
-    .tabela-responsiva { width: 100%; overflow-x: auto; }
+    .tabela-responsiva { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
     table { width: 100% !important; font-size: 10px; table-layout: fixed; border-collapse: collapse; }
     th, td { text-align: center; padding: 2px !important; white-space: normal !important; word-wrap: break-word; }
     .footer { text-align: center; font-size: 11px; color: #888; margin-top: 40px; padding: 10px; border-top: 1px solid #eee; }
@@ -1211,5 +1243,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
