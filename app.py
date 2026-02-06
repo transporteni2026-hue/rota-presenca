@@ -515,6 +515,20 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
 # INTERFACE
 # ==========================================================
 st.set_page_config(page_title="Rota Nova Iguaçu", layout="centered")
+
+# ==========================================================
+# AJUSTE PARA ZOOM COM PINÇA
+# ==========================================================
+st.markdown("""
+<script>
+    // Tenta modificar a viewport da página pai (Streamlit) para permitir zoom manual
+    var viewport = window.parent.document.querySelector('meta[name="viewport"]');
+    if (viewport) {
+        viewport.content = "width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes";
+    }
+</script>
+""", unsafe_allow_html=True)
+
 st.markdown('<script src="https://telegram.org/js/telegram-web-app.js"></script>', unsafe_allow_html=True)
 
 st.markdown("""
@@ -1211,5 +1225,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
