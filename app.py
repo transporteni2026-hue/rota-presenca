@@ -537,7 +537,6 @@ st.markdown("""
 
     /* ======================================================
        ALTERAÇÃO SOLICITADA (TELA): AUMENTAR FONTE (NOME/GRAD)
-       - deixa NOME e GRADUAÇÃO ~150% maiores, sem mexer no resto
        ====================================================== */
     .presenca-nome { font-size: 150%; font-weight: 800; line-height: 1.15; }
     .presenca-grad { font-size: 150%; font-weight: 800; line-height: 1.15; }
@@ -1163,28 +1162,57 @@ try:
                 st.caption("Atualiza sob demanda.")
 
             # ==========================================================
-            # ALTERAÇÃO SOLICITADA (TELA):
-            # - aumentar fonte em NOME e GRADUAÇÃO (~150%)
-            # - se existir DATA_HORA, ocultar na tabela exibida (só na visualização)
+            # NOVO: incluir TELEFONE (vem da aba Usuarios) na lista pós-login
+            # - cruza por EMAIL (df_o é "limpo", df_v pode conter HTML nos excedentes)
             # ==========================================================
+            tel_map = {}
+            try:
+                for uu in (records_u_public or []):
+                    em = str(uu.get("Email", "") or "").strip().lower()
+                    te = str(uu.get("TELEFONE", "") or "").strip()
+                    if em:
+                        tel_map[em] = tel_format_br(te) if te else ""
+            except Exception:
+                tel_map = {}
+
+            tel_series = pd.Series([""] * len(df_o))
+            if not df_o.empty and "EMAIL" in df_o.columns:
+                tel_series = df_o["EMAIL"].apply(lambda em: tel_map.get(str(em or "").strip().lower(), ""))
+
             df_v_show = df_v.copy()
 
-            # Aumenta fonte e mantém negrito, sem quebrar excedentes (span vermelho já existente)
+            # injeta coluna TELEFONE (sem depender do EMAIL do df_v, que pode ter <span> nos excedentes)
+            if len(df_v_show) == len(tel_series):
+                df_v_show.insert(5, "TELEFONE", tel_series.values)  # após LOTAÇÃO (posição 5 considerando Nº, QG, GRAD, NOME, LOTAÇÃO)
+                # Se for excedente, pinta o telefone também
+                if "Nº" in df_v_show.columns and "TELEFONE" in df_v_show.columns:
+                    def _tel_exc(i):
+                        try:
+                            return ("Exc-" in str(df_v_show.at[i, "Nº"]))
+                        except Exception:
+                            return False
+                    for i in range(len(df_v_show)):
+                        if _tel_exc(i):
+                            df_v_show.at[i, "TELEFONE"] = f"<span style='color:#d32f2f; font-weight:bold;'>{df_v_show.at[i, 'TELEFONE']}</span>"
+
+            # ==========================================================
+            # ALTERAÇÃO SOLICITADA (TELA):
+            # 1) Zebra (linhas alternadas) via CSS na classe 'presenca-zebra'
+            # 2) Nome em negrito + maior (sem quebrar excedentes)
+            # 3) Graduação maior (sem quebrar excedentes)
+            # 4) Oculta DATA_HORA apenas na exibição (se existir)
+            # ==========================================================
             if "GRADUAÇÃO" in df_v_show.columns:
                 df_v_show["GRADUAÇÃO"] = df_v_show["GRADUAÇÃO"].apply(lambda x: f"<span class='presenca-grad'>{x}</span>")
             if "NOME" in df_v_show.columns:
                 df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<span class='presenca-nome'><b>{x}</b></span>")
 
-            # Oculta DATA_HORA (ou DATA/HORA) somente na tabela visível, se existir
             cols_drop = []
             if "DATA_HORA" in df_v_show.columns:
                 cols_drop.append("DATA_HORA")
             if "DATA/HORA" in df_v_show.columns:
                 cols_drop.append("DATA/HORA")
-
-            # (sempre ocultava EMAIL)
             cols_drop.append("EMAIL")
-
             cols_drop = [c for c in cols_drop if c in df_v_show.columns]
 
             st.write(
