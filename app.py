@@ -534,6 +534,13 @@ st.markdown("""
        ====================================================== */
     table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
     table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
+
+    /* ======================================================
+       ALTERAÇÃO SOLICITADA (TELA): AUMENTAR FONTE (NOME/GRAD)
+       - deixa NOME e GRADUAÇÃO ~150% maiores, sem mexer no resto
+       ====================================================== */
+    .presenca-nome { font-size: 150%; font-weight: 800; line-height: 1.15; }
+    .presenca-grad { font-size: 150%; font-weight: 800; line-height: 1.15; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1031,7 +1038,6 @@ try:
 
             st.stop()
 
-
         st.sidebar.markdown("### 👤 Usuário Conectado 🙍‍♂️")
         st.sidebar.info(f"**{u.get('Graduação')} {u.get('Nome')}**")
 
@@ -1158,16 +1164,32 @@ try:
 
             # ==========================================================
             # ALTERAÇÃO SOLICITADA (TELA):
-            # 1) Zebra (linhas alternadas) via CSS na classe 'presenca-zebra'
-            # 2) Nome em negrito (coluna NOME) sem quebrar excedentes (span vermelho)
+            # - aumentar fonte em NOME e GRADUAÇÃO (~150%)
+            # - se existir DATA_HORA, ocultar na tabela exibida (só na visualização)
             # ==========================================================
             df_v_show = df_v.copy()
+
+            # Aumenta fonte e mantém negrito, sem quebrar excedentes (span vermelho já existente)
+            if "GRADUAÇÃO" in df_v_show.columns:
+                df_v_show["GRADUAÇÃO"] = df_v_show["GRADUAÇÃO"].apply(lambda x: f"<span class='presenca-grad'>{x}</span>")
             if "NOME" in df_v_show.columns:
-                df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<b>{x}</b>")
+                df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<span class='presenca-nome'><b>{x}</b></span>")
+
+            # Oculta DATA_HORA (ou DATA/HORA) somente na tabela visível, se existir
+            cols_drop = []
+            if "DATA_HORA" in df_v_show.columns:
+                cols_drop.append("DATA_HORA")
+            if "DATA/HORA" in df_v_show.columns:
+                cols_drop.append("DATA/HORA")
+
+            # (sempre ocultava EMAIL)
+            cols_drop.append("EMAIL")
+
+            cols_drop = [c for c in cols_drop if c in df_v_show.columns]
 
             st.write(
                 f"<div class='tabela-responsiva'>"
-                f"{df_v_show.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
+                f"{df_v_show.drop(columns=cols_drop).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
                 f"</div>",
                 unsafe_allow_html=True
             )
@@ -1211,5 +1233,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
