@@ -538,8 +538,8 @@ st.markdown("""
     /* ======================================================
        ALTERAÇÃO SOLICITADA (TELA): AUMENTAR FONTE (NOME/GRAD)
        ====================================================== */
-    .presenca-nome { font-size: 150%; font-weight: 800; line-height: 1.15; }
-    .presenca-grad { font-size: 150%; font-weight: 800; line-height: 1.15; }
+    .presenca-nome { font-size: 120%; font-weight: 800; line-height: 1.15; }
+    .presenca-grad { font-size: 120%; font-weight: 800; line-height: 1.15; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1261,3 +1261,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
