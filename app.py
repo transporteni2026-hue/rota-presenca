@@ -534,6 +534,13 @@ st.markdown("""
        ====================================================== */
     table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
     table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
+
+    /* ======================================================
+       ALTERAÇÃO SOLICITADA (TELA):
+       Aumentar em 30% a fonte APENAS dos DADOS da coluna NOME
+       (NOME é a 5ª coluna na tabela exibida)
+       ====================================================== */
+    table.presenca-zebra tbody td:nth-child(5) { font-size: 130% !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1211,5 +1218,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
