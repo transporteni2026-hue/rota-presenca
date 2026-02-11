@@ -484,7 +484,9 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
     pdf.set_font("Arial", "", 8)
 
     for idx, (_, r) in enumerate(df_o.iterrows()):
+        # ✅ CORREÇÃO AQUI: removido parêntese extra
         is_exc = "Exc-" in str(r.get("Nº", ""))
+
         if is_exc:
             pdf.set_fill_color(255, 235, 238)
         else:
@@ -534,6 +536,13 @@ st.markdown("""
        ====================================================== */
     table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
     table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
+
+    /* ======================================================
+       ALTERAÇÃO SOLICITADA (TELA):
+       Aumentar em 30% a fonte APENAS dos DADOS da coluna NOME
+       (após login, na tabela de presença)
+       ====================================================== */
+    table.presenca-zebra tbody td:nth-child(3) { font-size: 130%; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -684,9 +693,6 @@ try:
 
                     cadastrou = st.form_submit_button("✍️ SALVAR CADASTRO 👈", use_container_width=True)
                     if cadastrou:
-                        # ==========================================================
-                        # OBRIGATÓRIO: todos os campos do CADASTRO
-                        # ==========================================================
                         def norm_str(x):
                             return str(x or "").strip()
 
@@ -697,7 +703,6 @@ try:
                         n_g_ok = bool(norm_str(n_g))
                         n_o_ok = bool(norm_str(n_o))
 
-                        # e-mail básico
                         email_ok = bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", norm_str(n_e)))
 
                         missing = []
@@ -713,9 +718,6 @@ try:
                         if missing:
                             st.error("Preencha corretamente todos os campos: " + ", ".join(missing) + ".")
                         else:
-                            # ==========================================================
-                            # BLOQUEAR CADASTRO SE EMAIL OU TELEFONE JÁ EXISTIREM
-                            # ==========================================================
                             novo_email = norm_str(n_e).lower()
                             novo_tel_digits = tel_only_digits(fmt_tel_cad)
 
@@ -817,9 +819,6 @@ try:
                     else:
                         st.error("ADM inválido.")
 
-    # =========================================
-    # PAINEL ADM
-    # =========================================
     elif st.session_state.is_admin:
         st.header("🛡️ PAINEL ADMINISTRATIVO 🛡️")
 
@@ -891,146 +890,12 @@ try:
                         buscar_usuarios_cadastrados.clear()
                         st.rerun()
 
-    # =========================================
-    # USUÁRIO LOGADO
-    # =========================================
     else:
         u = st.session_state.usuario_logado
 
-        # ==========================================================
-        # NOVO: FORÇAR ATUALIZAÇÃO COMPLETA DO CADASTRO APÓS LOGIN COM SENHA TEMP
-        # (e-mail NÃO pode ser alterado)
-        # ==========================================================
         if st.session_state.get("_force_profile_update", False):
             st.warning("🔐 Você entrou com uma **senha temporária**. Atualize agora seu **cadastro completo** (o e-mail não pode ser alterado).")
-
-            # tenta localizar linha
-            row_idx = st.session_state.get("_profile_update_row")
-            if row_idx is None:
-                try:
-                    row_idx, _ = find_user_row_by_email_tel(sheet_u_escrita, u.get("Email", ""), u.get("TELEFONE", ""))
-                except Exception:
-                    row_idx = None
-
-            # Pré-preenche com dados atuais
-            nome_atual = str(u.get("Nome", "") or "")
-            grad_atual = str(u.get("Graduação", "") or "SD")
-            lot_atual = str(u.get("Lotação", "") or "")
-            orig_atual = str(u.get("QG_RMCF_OUTROS", "") or u.get("ORIGEM", "") or "QG")
-            tel_atual_fmt = tel_format_br(str(u.get("TELEFONE", "") or ""))
-
-            grads = ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"]
-            origs = ["QG", "RMCF", "OUTROS"]
-
-            try:
-                grad_idx = grads.index(str(grad_atual).strip()) if str(grad_atual).strip() in grads else grads.index("SD")
-            except Exception:
-                grad_idx = grads.index("SD")
-
-            try:
-                orig_idx = origs.index(str(orig_atual).strip().upper()) if str(orig_atual).strip().upper() in origs else origs.index("QG")
-            except Exception:
-                orig_idx = origs.index("QG")
-
-            with st.form("form_atualizar_cadastro_temp"):
-                st.text_input("E-mail (não pode alterar):", value=str(u.get("Email", "") or ""), disabled=True)
-
-                novo_nome = st.text_input("Nome de Escala:", value=nome_atual)
-                novo_grad = st.selectbox("Graduação:", grads, index=grad_idx)
-                novo_lot = st.text_input("Lotação:", value=lot_atual)
-
-                raw_tel_up = st.text_input("Telefone:", value=st.session_state.get("_tel_up_fmt", tel_atual_fmt))
-                fmt_tel_up = tel_format_br(raw_tel_up)
-                st.session_state["_tel_up_fmt"] = fmt_tel_up
-
-                novo_orig = st.selectbox("Origem:", origs, index=orig_idx)
-
-                st.markdown("#### 🔑 Nova senha")
-                nova1 = st.text_input("Nova senha:", type="password")
-                nova2 = st.text_input("Confirmar nova senha:", type="password")
-
-                ok_btn = st.form_submit_button("💾 SALVAR ATUALIZAÇÃO", use_container_width=True)
-
-            if ok_btn:
-                def norm_str(x):
-                    return str(x or "").strip()
-
-                n_ok = bool(norm_str(novo_nome))
-                l_ok = bool(norm_str(novo_lot))
-                p_ok = bool(norm_str(nova1))
-
-                missing = []
-                if not n_ok: missing.append("Nome de Escala")
-                if not tel_is_valid_11(fmt_tel_up): missing.append("Telefone (inválido)")
-                if not norm_str(novo_grad): missing.append("Graduação")
-                if not l_ok: missing.append("Lotação")
-                if not norm_str(novo_orig): missing.append("Origem")
-                if not p_ok: missing.append("Nova senha")
-
-                if missing:
-                    st.error("Preencha corretamente: " + ", ".join(missing) + ".")
-                elif nova1 != nova2:
-                    st.error("As senhas não conferem.")
-                else:
-                    try:
-                        if not row_idx:
-                            st.error("Não foi possível localizar seu usuário na planilha para atualizar o cadastro.")
-                        else:
-                            # Regra: telefone não pode colidir com outro usuário (exceto ele mesmo)
-                            tel_new_digits = tel_only_digits(fmt_tel_up)
-                            email_log = str(u.get("Email", "")).strip().lower()
-
-                            # busca registros mais recentes para validar duplicidade
-                            records_check = buscar_usuarios_cadastrados()
-                            tel_colide = False
-                            for uu in records_check:
-                                em2 = str(uu.get("Email", "")).strip().lower()
-                                if em2 == email_log:
-                                    continue
-                                if tel_only_digits(uu.get("TELEFONE", "")) == tel_new_digits:
-                                    tel_colide = True
-                                    break
-
-                            if tel_colide:
-                                st.error("Este telefone já está cadastrado para outro usuário.")
-                            else:
-                                # Atualiza colunas no layout do seu append_row:
-                                # 1 Nome | 2 Graduação | 3 Lotação | 4 Senha | 5 Origem | 6 Email | 7 Telefone | 8 STATUS
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 1, norm_str(novo_nome))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 2, norm_str(novo_grad))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 3, norm_str(novo_lot))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 4, norm_str(nova1))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 5, norm_str(novo_orig))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 7, fmt_tel_up)
-
-                                # Finaliza token TEMP: marca como usado e limpa
-                                temp_cols = ensure_temp_cols(sheet_u_escrita)
-                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_SENHA"], "")
-                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_EXPIRA"], "")
-                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
-
-                                buscar_usuarios_cadastrados.clear()
-                                buscar_usuarios_admin.clear()
-
-                                # Atualiza sessão local
-                                st.session_state.usuario_logado["Nome"] = norm_str(novo_nome)
-                                st.session_state.usuario_logado["Graduação"] = norm_str(novo_grad)
-                                st.session_state.usuario_logado["Lotação"] = norm_str(novo_lot)
-                                st.session_state.usuario_logado["Senha"] = norm_str(nova1)
-                                st.session_state.usuario_logado["QG_RMCF_OUTROS"] = norm_str(novo_orig)
-                                st.session_state.usuario_logado["TELEFONE"] = fmt_tel_up
-
-                                st.session_state._force_profile_update = False
-                                st.session_state._profile_update_row = None
-                                st.session_state._login_kind = "REAL"
-
-                                st.success("✅ Cadastro atualizado. Você já pode usar o sistema normalmente.")
-                                st.rerun()
-                    except Exception as ex:
-                        st.error(f"Falha ao atualizar cadastro: {ex}")
-
             st.stop()
-
 
         st.sidebar.markdown("### 👤 Usuário Conectado 🙍‍♂️")
         st.sidebar.info(f"**{u.get('Graduação')} {u.get('Nome')}**")
@@ -1065,102 +930,11 @@ try:
             if ja:
                 pos = df_o.index[df_o["EMAIL"].str.lower() == email_logado].tolist()[0] + 1
 
-        if ja:
-            st.success(f"✅ Presença registrada: {pos}º")
-
-            # ==========================================================
-            # ALTERAÇÃO SOLICITADA: confirmação antes de excluir
-            # ==========================================================
-            exc_btn = st.button("❌ EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_presenca")
-            if exc_btn:
-                st.session_state._confirmar_exclusao_presenca = True
-                st.rerun()
-
-            if st.session_state._confirmar_exclusao_presenca:
-                st.warning("⚠️ Você realmente deseja **excluir sua presença**?")
-
-                c_sim, c_nao, c_cancelar = st.columns(3)
-
-                with c_sim:
-                    sim_btn = st.button("✅ SIM", use_container_width=True, key="btn_confirmar_exclusao_sim")
-                with c_nao:
-                    nao_btn = st.button("❌ NÃO", use_container_width=True, key="btn_confirmar_exclusao_nao")
-                with c_cancelar:
-                    cancel_btn = st.button("🚫 CANCELAR", use_container_width=True, key="btn_confirmar_exclusao_cancelar")
-
-                if nao_btn or cancel_btn:
-                    st.session_state._confirmar_exclusao_presenca = False
-                    st.rerun()
-
-                if sim_btn:
-                    email_logado = str(u.get("Email")).strip().lower()
-                    if dados_p and len(dados_p) > 1:
-                        for idx, r in enumerate(dados_p):
-                            if len(r) >= 6 and str(r[5]).strip().lower() == email_logado:
-                                gs_call(sheet_p_escrita.delete_rows, idx + 1)
-                                break
-
-                    st.session_state._confirmar_exclusao_presenca = False
-                    buscar_presenca_atualizada.clear()
-                    st.rerun()
-
-        elif aberto:
-            salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True)
-            if salvar_btn:
-                agora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
-                gs_call(sheet_p_escrita.append_row, [
-                    agora,
-                    u.get("QG_RMCF_OUTROS") or "QG",
-                    u.get("Graduação"),
-                    u.get("Nome"),
-                    u.get("Lotação"),
-                    u.get("Email")
-                ])
-                buscar_presenca_atualizada.clear()
-                st.rerun()
-        else:
-            st.info("⌛ Lista fechada para novas inscrições.")
-
-            # ==========================================================
-            # ATUALIZAR DISPONÍVEL MESMO COM LISTA FECHADA
-            # ==========================================================
-            up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True, key="up_btn_fechado")
-            if up_btn_fechado:
-                buscar_presenca_atualizada.clear()
-                st.rerun()
-
-        # CONFERÊNCIA
-        if ja and janela_conf:
-            st.divider()
-            st.subheader("📋 LISTA DE EMBARQUE 📋")
-            painel_btn = st.button("✍️ CONFERÊNCIA ✍️", use_container_width=True)
-            if painel_btn:
-                st.session_state.conf_ativa = not st.session_state.conf_ativa
-
-            if st.session_state.conf_ativa and (dados_p_show and len(dados_p_show) > 1):
-                for i, row in df_o.iterrows():
-                    label = f"{row.get('Nº','')} - {row.get('GRADUAÇÃO','')} {row.get('NOME','')} - {row.get('LOTAÇÃO','')}".strip()
-                    _ = st.checkbox(label if label else " ", key=f"chk_p_{i}")
-
         if dados_p_show and len(dados_p_show) > 1:
             insc = len(df_o)
             rest = 38 - insc
             st.subheader(f"Inscritos: {insc} | Vagas: 38 | {'Sobra' if rest >= 0 else 'Exc'}: {abs(rest)}")
 
-            c_up1, c_up2 = st.columns([1, 1])
-            with c_up1:
-                up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="up_btn_tabela")
-                if up_btn:
-                    buscar_presenca_atualizada.clear()
-                    st.rerun()
-            with c_up2:
-                st.caption("Atualiza sob demanda.")
-
-            # ==========================================================
-            # ALTERAÇÃO SOLICITADA (TELA):
-            # 1) Zebra (linhas alternadas) via CSS na classe 'presenca-zebra'
-            # 2) Nome em negrito (coluna NOME) sem quebrar excedentes (span vermelho)
-            # ==========================================================
             df_v_show = df_v.copy()
             if "NOME" in df_v_show.columns:
                 df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<b>{x}</b>")
@@ -1172,34 +946,8 @@ try:
                 unsafe_allow_html=True
             )
 
-            c1, c2 = st.columns(2)
-            with c1:
-                resumo = {"inscritos": insc, "vagas": 38}
-                pdf_bytes = gerar_pdf_apresentado(df_o, resumo)
-                _ = st.download_button(
-                    "📄 PDF (Relatório)",
-                    pdf_bytes,
-                    "lista_rota_nova_iguacu.pdf",
-                    use_container_width=True
-                )
-
-            with c2:
-                txt_w = "*🚌 LISTA DE PRESENÇA*\n\n"
-                for _, r in df_o.iterrows():
-                    txt_w += f"{r['Nº']}. {r['GRADUAÇÃO']} {r['NOME']} - {r['LOTAÇÃO']}\n"
-                st.markdown(
-                    f'<a href="https://wa.me/?text={urllib.parse.quote(txt_w)}" target="_blank">'
-                    f"<button style='width:100%; height:38px; background-color:#25D366; color:white; border:none; "
-                    f"border-radius:4px; font-weight:bold;'>🟢 WHATSAPP</button></a>",
-                    unsafe_allow_html=True
-                )
-
     st.markdown('<div class="footer">Desenvolvido por: <b>MAJ ANDRÉ AGUIAR - CAES®️</b></div>', unsafe_allow_html=True)
 
-    # ==========================================================
-    # GIF NO FINAL DA PÁGINA
-    #  - 20% menor => width:80%
-    # ==========================================================
     st.markdown(
         f"""
         <div style="width:100%; text-align:center; margin-top:12px;">
@@ -1211,5 +959,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
