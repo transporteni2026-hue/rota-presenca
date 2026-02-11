@@ -534,14 +534,6 @@ st.markdown("""
        ====================================================== */
     table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
     table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
-
-    /* ======================================================
-       ALTERAÇÃO SOLICITADA (TELA):
-       Aumentar em 30% a fonte APENAS dos DADOS da coluna NOME
-       (após login, na tabela de presença)
-       Obs: NOME é a 3ª coluna na tabela exibida (Nº, GRADUAÇÃO, NOME, ...)
-       ====================================================== */
-    table.presenca-zebra tbody td:nth-child(3) { font-size: 130%; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1219,3 +1211,5 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
+
