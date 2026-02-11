@@ -484,7 +484,7 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
     pdf.set_font("Arial", "", 8)
 
     for idx, (_, r) in enumerate(df_o.iterrows()):
-        is_exc = "Exc-" in str(r.get("Nº", ""))
+        is_exc = "Exc-" in str(r.get("Nº", "")))
         if is_exc:
             pdf.set_fill_color(255, 235, 238)
         else:
@@ -534,6 +534,14 @@ st.markdown("""
        ====================================================== */
     table.presenca-zebra tbody tr:nth-child(odd)  { background: #f5f5f5; }
     table.presenca-zebra tbody tr:nth-child(even) { background: #ffffff; }
+
+    /* ======================================================
+       ALTERAÇÃO SOLICITADA (TELA):
+       Aumentar em 30% a fonte APENAS dos DADOS da coluna NOME
+       (após login, na tabela de presença)
+       Obs: NOME é a 3ª coluna na tabela exibida (Nº, GRADUAÇÃO, NOME, ...)
+       ====================================================== */
+    table.presenca-zebra tbody td:nth-child(3) { font-size: 130%; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1211,4 +1219,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
