@@ -540,7 +540,7 @@ st.markdown("""
        Aumentar em 30% a fonte APENAS dos DADOS da coluna NOME
        (NOME é a 5ª coluna na tabela exibida)
        ====================================================== */
-    table.presenca-zebra tbody td:nth-child(5) { font-size: 110% !important; }
+    table.presenca-zebra tbody td:nth-child(5) { font-size: 105% !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1218,5 +1218,6 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
 
 
