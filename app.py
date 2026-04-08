@@ -407,13 +407,16 @@ def aplicar_ordenacao(df):
 
     df.insert(0, "Nº", [str(i + 1) if i < 38 else f"Exc-{i - 37:02d}" for i in range(len(df))])
 
-    df_v = df.copy()
+    # Remove primeiro as colunas auxiliares para evitar erro de dtype ao inserir HTML
+    df_final = df.drop(columns=["grupo_fc", "p_o", "p_g", "dt"]).copy()
+    df_v = df_final.copy()
+
     for i, r in df_v.iterrows():
         if "Exc-" in str(r["Nº"]):
             for c in df_v.columns:
                 df_v.at[i, c] = f"<span style='color:#d32f2f; font-weight:bold;'>{r[c]}</span>"
 
-    return df.drop(columns=["grupo_fc", "p_o", "p_g", "dt"]), df_v.drop(columns=["grupo_fc", "p_o", "p_g", "dt"])
+    return df_final, df_v
 
 
 # ==========================================================
@@ -1211,6 +1214,3 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
-
-
-
