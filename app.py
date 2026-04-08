@@ -813,7 +813,7 @@ try:
                 ad_s = st.text_input("Senha ADM:", type="password")
                 entrou_adm = st.form_submit_button("☠️ ACESSAR PAINEL ☠️")
                 if entrou_adm:
-                    if ad_u == "Administrador" and ad_s == "Administrador@123":
+                    if ad_u == "@" and ad_s == "@":
                         st.session_state.is_admin = True
                         st.session_state._adm_first_load = True
                         st.rerun()
