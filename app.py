@@ -22,6 +22,7 @@ scope = [
 SPREADSHEET_NAME = "ListaPresenca"
 WS_USUARIOS = "Usuarios"
 WS_CONFIG = "Config"
+WS_HISTORICO = "Historico"
 
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
 
@@ -125,11 +126,31 @@ def ws_config():
         gs_call(sheet_c.update, "A1:A2", [["LIMITE"], ["100"]])
         return sheet_c
 
+@st.cache_resource
+def ws_historico():
+    """
+    Aba onde as listas encerradas serão arquivadas antes da limpeza do ciclo.
+    Se a aba não existir, ela será criada automaticamente.
+    """
+    doc = abrir_documento()
+    try:
+        sheet_h = gs_call(doc.worksheet, WS_HISTORICO)
+    except Exception:
+        sheet_h = gs_call(doc.add_worksheet, title=WS_HISTORICO, rows="1000", cols=str(len(HIST_HEADERS)))
+        gs_call(sheet_h.update, "A1", [HIST_HEADERS])
+    return sheet_h
+
 
 # ==========================================================
 # SENHA TEMPORÁRIA (1 acesso) - RECUPERAÇÃO SEGURA
 # ==========================================================
 TEMP_HEADERS = ["TEMP_SENHA", "TEMP_EXPIRA", "TEMP_USADA"]
+
+# Cabeçalho da aba Historico, criada automaticamente no Google Sheets
+HIST_HEADERS = [
+    "CICLO_ID", "DATA_CICLO", "EMBARQUE", "ARQUIVADO_EM",
+    "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"
+]
 
 def _br_now():
     return datetime.now(FUSO_BR)
@@ -246,6 +267,14 @@ def buscar_presenca_atualizada():
     except Exception:
         return None
 
+@st.cache_data(ttl=30)
+def buscar_historico_dados():
+    try:
+        sheet_h = ws_historico()
+        return gs_call(sheet_h.get_all_values)
+    except Exception:
+        return None
+
 
 # ==========================================================
 # FILTRO PARA NÃO EXIBIR LINHAS “LIXO” (evita final estranho)
@@ -280,6 +309,109 @@ def filtrar_linhas_presenca(dados_p):
     return [header] + body_ok
 
 
+# ==========================================================
+# HISTÓRICO: arquiva a lista antes da limpeza automática
+# ==========================================================
+def ensure_historico_headers(sheet_h):
+    """Garante o cabeçalho correto na aba Historico."""
+    try:
+        headers = gs_call(sheet_h.row_values, 1)
+        headers = [str(h).strip() for h in headers]
+        if headers[:len(HIST_HEADERS)] != HIST_HEADERS:
+            gs_call(sheet_h.update, "A1", [HIST_HEADERS])
+    except Exception:
+        gs_call(sheet_h.update, "A1", [HIST_HEADERS])
+
+
+def _parse_data_hora_presenca(valor):
+    try:
+        return FUSO_BR.localize(datetime.strptime(str(valor).strip(), "%d/%m/%Y %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def identificar_ciclo_da_lista(dados_p):
+    """
+    Descobre a qual ciclo a lista pertence a partir dos horários de inscrição.
+    Mantém a mesma lógica exibida no topo do app:
+    - inscrições após 19:00 => embarque 06:30 do dia seguinte;
+    - inscrições antes de 07:00 => embarque 06:30 do mesmo dia;
+    - demais horários => embarque 18:30 do mesmo dia.
+    """
+    datas = []
+    for row in (dados_p or [])[1:]:
+        if row:
+            dt = _parse_data_hora_presenca(row[0])
+            if dt:
+                datas.append(dt)
+
+    base = min(datas) if datas else datetime.now(FUSO_BR)
+    t = base.time()
+
+    if t >= time(19, 0):
+        data_ciclo = (base + timedelta(days=1)).date()
+        embarque = "06:30"
+    elif t < time(7, 0):
+        data_ciclo = base.date()
+        embarque = "06:30"
+    else:
+        data_ciclo = base.date()
+        embarque = "18:30"
+
+    ciclo_id = f"{data_ciclo.strftime('%Y%m%d')}_{embarque.replace(':', '')}"
+    return ciclo_id, data_ciclo.strftime("%d/%m/%Y"), embarque
+
+
+def arquivar_lista_antes_de_limpar(dados_p):
+    """
+    Copia a lista atual para a aba Historico antes de apagar a aba principal.
+    A função evita duplicidade usando CICLO_ID.
+    Em caso de falha no histórico, o app continua com o fluxo atual para não travar a lista.
+    """
+    if not dados_p or len(dados_p) < 2:
+        return False
+
+    try:
+        sheet_h = ws_historico()
+        ensure_historico_headers(sheet_h)
+
+        ciclo_id, data_ciclo, embarque = identificar_ciclo_da_lista(dados_p)
+
+        historico_atual = gs_call(sheet_h.get_all_values)
+        if historico_atual and len(historico_atual) > 1:
+            for row in historico_atual[1:]:
+                if row and str(row[0]).strip() == ciclo_id:
+                    return False
+
+        arquivado_em = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+        linhas = []
+        for row in dados_p[1:]:
+            r = list(row) + [""] * 6
+            r = r[:6]
+            linhas.append([
+                ciclo_id,
+                data_ciclo,
+                embarque,
+                arquivado_em,
+                r[0],  # DATA_HORA
+                r[1],  # QG_RMCF_OUTROS
+                r[2],  # GRADUAÇÃO
+                r[3],  # NOME
+                r[4],  # LOTAÇÃO
+                r[5],  # EMAIL
+            ])
+
+        if linhas:
+            gs_call(sheet_h.append_rows, linhas, value_input_option="USER_ENTERED")
+            buscar_historico_dados.clear()
+            return True
+    except Exception:
+        # Não bloqueia o funcionamento atual do app caso o histórico falhe.
+        return False
+
+    return False
+
+
 def verificar_status_e_limpar(sheet_p, dados_p):
     agora = datetime.now(FUSO_BR)
     hora_atual, dia_semana = agora.time(), agora.weekday()
@@ -296,6 +428,7 @@ def verificar_status_e_limpar(sheet_p, dados_p):
             ultima_str = dados_p[-1][0]
             ultima_dt = FUSO_BR.localize(datetime.strptime(ultima_str, "%d/%m/%Y %H:%M:%S"))
             if ultima_dt < marco:
+                arquivar_lista_antes_de_limpar(dados_p)
                 gs_call(sheet_p.resize, rows=1)
                 gs_call(sheet_p.resize, rows=100)
                 st.session_state["_force_refresh_presenca"] = True
@@ -450,9 +583,11 @@ class PDFRelatorio(FPDF):
         self.cell(0, 6, f"Página {self.page_no()}/{{nb}} - Rota Nova Iguaçu", align="C")
 
 
-def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
+def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str = "") -> bytes:
     agora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
     sub = f"Emitido em: {agora}"
+    if subtitulo_extra:
+        sub = f"{sub} | {subtitulo_extra}"
 
     pdf = PDFRelatorio(titulo="ROTA NOVA IGUAÇU - LISTA DE PRESENÇA", sub=sub)
     pdf.add_page()
@@ -512,6 +647,105 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict) -> bytes:
     pdf.set_text_color(0, 0, 0)
 
     return pdf.output(dest="S").encode("latin-1")
+
+
+# ==========================================================
+# TELA DO HISTÓRICO
+# ==========================================================
+def render_historico_page():
+    st.header("📚 Histórico")
+    st.caption("As listas encerradas são salvas automaticamente quando um novo ciclo começa e a lista antiga é limpa.")
+
+    dados_h = buscar_historico_dados()
+    if not dados_h or len(dados_h) < 2:
+        st.info("Ainda não há listas arquivadas. O primeiro histórico será criado automaticamente quando uma lista antiga for zerada no início de um novo ciclo.")
+        return
+
+    headers = list(dados_h[0])
+    rows = dados_h[1:]
+    df_h = pd.DataFrame(rows, columns=headers)
+
+    # Garante as colunas esperadas mesmo se a aba tiver sido criada manualmente com algo faltando.
+    for col in HIST_HEADERS:
+        if col not in df_h.columns:
+            df_h[col] = ""
+
+    df_h["DATA_CICLO_DT"] = pd.to_datetime(df_h["DATA_CICLO"], dayfirst=True, errors="coerce").dt.date
+    datas_disponiveis = sorted([d for d in df_h["DATA_CICLO_DT"].dropna().unique()])
+
+    if not datas_disponiveis:
+        st.warning("Existe aba de histórico, mas não encontrei nenhuma data válida salva nela.")
+        return
+
+    data_padrao = datas_disponiveis[-1]
+    data_escolhida = st.date_input(
+        "Selecione a data da lista arquivada:",
+        value=data_padrao,
+        min_value=datas_disponiveis[0],
+        max_value=datas_disponiveis[-1],
+        format="DD/MM/YYYY"
+    )
+
+    if data_escolhida not in datas_disponiveis:
+        ultimas = ", ".join([d.strftime("%d/%m/%Y") for d in datas_disponiveis[-10:]])
+        st.warning(f"Não há lista salva para essa data. Datas disponíveis mais recentes: {ultimas}.")
+        return
+
+    df_dia = df_h[df_h["DATA_CICLO_DT"] == data_escolhida].copy()
+    ciclos = []
+    for ciclo_id, grupo in df_dia.groupby("CICLO_ID", sort=False):
+        embarque = str(grupo["EMBARQUE"].iloc[0]).strip() or "--:--"
+        data_ciclo = str(grupo["DATA_CICLO"].iloc[0]).strip()
+        ciclos.append((ciclo_id, f"EMBARQUE {embarque}h - {data_ciclo}"))
+
+    if not ciclos:
+        st.warning("Não encontrei ciclo salvo para essa data.")
+        return
+
+    if len(ciclos) == 1:
+        ciclo_escolhido = ciclos[0][0]
+        st.success(f"Lista encontrada: {ciclos[0][1]}")
+    else:
+        opcoes = {label: cid for cid, label in ciclos}
+        label_escolhida = st.selectbox("Selecione o ciclo:", list(opcoes.keys()))
+        ciclo_escolhido = opcoes[label_escolhida]
+
+    df_ciclo = df_dia[df_dia["CICLO_ID"] == ciclo_escolhido].copy()
+    if df_ciclo.empty:
+        st.warning("O ciclo selecionado está vazio.")
+        return
+
+    df_base = df_ciclo[["DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"]].copy()
+    df_o_hist, df_v_hist = aplicar_ordenacao(df_base)
+
+    insc = len(df_o_hist)
+    st.subheader(f"Inscritos: {insc} | Vagas: 38 | {'Sobra' if 38 - insc >= 0 else 'Exc'}: {abs(38 - insc)}")
+
+    df_v_show = df_v_hist.copy()
+    if "NOME" in df_v_show.columns:
+        df_v_show["NOME"] = df_v_show["NOME"].apply(lambda x: f"<b>{x}</b>")
+
+    st.write(
+        f"<div class='tabela-responsiva'>"
+        f"{df_v_show.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    data_ciclo_pdf = str(df_ciclo["DATA_CICLO"].iloc[0]).strip()
+    embarque_pdf = str(df_ciclo["EMBARQUE"].iloc[0]).strip()
+    subtitulo = f"Histórico: EMBARQUE {embarque_pdf}h do dia {data_ciclo_pdf}"
+    resumo = {"inscritos": insc, "vagas": 38}
+    pdf_bytes = gerar_pdf_apresentado(df_o_hist, resumo, subtitulo_extra=subtitulo)
+
+    nome_pdf = f"historico_rota_nova_iguacu_{ciclo_escolhido}.pdf"
+    st.download_button(
+        "📄 GERAR PDF DO HISTÓRICO",
+        pdf_bytes,
+        nome_pdf,
+        mime="application/pdf",
+        use_container_width=True
+    )
 
 
 # ==========================================================
@@ -765,7 +999,7 @@ try:
 
             **2. Observação:**
             * Nos períodos em que a lista ficar suspensa para conferência (05:00h às 07:00h / 17:00h às 19:00h), os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
-            * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Sendo assim, caso queira manter um histórico de viagem, antes desses horários, faça o download do pdf e/ou do resumo do W.Zap.
+            * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Antes de ser zerada, a lista anterior será arquivada automaticamente na aba **Histórico**, onde poderá ser consultada por data e baixada em PDF.
             """)
 
         with t4:
@@ -1045,6 +1279,8 @@ try:
             st.rerun()
 
         st.sidebar.markdown("---")
+        menu_usuario = st.sidebar.radio("Menu", ["Lista Atual", "Histórico"], index=0)
+        st.sidebar.markdown("---")
         st.sidebar.caption("Desenvolvido por: MAJ ANDRÉ AGUIAR - AAES®️")
 
         sheet_p_escrita = ws_presenca()
@@ -1057,6 +1293,10 @@ try:
         dados_p_show = filtrar_linhas_presenca(dados_p)
 
         aberto, janela_conf = verificar_status_e_limpar(sheet_p_escrita, dados_p_show)
+
+        if menu_usuario == "Histórico":
+            render_historico_page()
+            st.stop()
 
         df_o, df_v = pd.DataFrame(), pd.DataFrame()
         ja, pos = False, 999
