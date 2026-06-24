@@ -27,6 +27,9 @@ WS_HISTORICO = "Historico"
 # Capacidade padrão usada quando a Config ainda não tiver valor definido pelo ADM.
 CAPACIDADE_PADRAO_ONIBUS = 38
 
+# Campo criado automaticamente na aba Usuarios para marcar quem possui prioridade de embarque.
+PRIORIDADE_HEADER = "PRIORIDADE_LISTA"
+
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
 
 # ==========================================================
@@ -153,7 +156,7 @@ TEMP_HEADERS = ["TEMP_SENHA", "TEMP_EXPIRA", "TEMP_USADA"]
 HIST_HEADERS = [
     "CICLO_ID", "DATA_CICLO", "EMBARQUE", "ARQUIVADO_EM",
     "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL",
-    "CAPACIDADE_ONIBUS"
+    "CAPACIDADE_ONIBUS", PRIORIDADE_HEADER
 ]
 
 def _br_now():
@@ -202,6 +205,54 @@ def ensure_temp_cols(sheet_u):
             gs_call(sheet_u.update, rng_col, vals)
 
     return {h: new_headers.index(h) + 1 for h in TEMP_HEADERS}
+
+
+def ensure_prioridade_col(sheet_u):
+    """
+    Garante a coluna PRIORIDADE_LISTA na aba Usuarios.
+    Valores esperados: SIM ou NAO.
+    """
+    headers = gs_call(sheet_u.row_values, 1)
+    headers = [str(h).strip() for h in headers if str(h).strip() != ""]
+
+    if PRIORIDADE_HEADER in headers:
+        return headers.index(PRIORIDADE_HEADER) + 1
+
+    new_headers = headers + [PRIORIDADE_HEADER]
+    gs_call(sheet_u.update, "A1", [new_headers])
+
+    rows = gs_call(sheet_u.get_all_values)
+    n_rows = len(rows)
+    if n_rows >= 2:
+        col_idx = new_headers.index(PRIORIDADE_HEADER) + 1
+        col_letter = gspread.utils.rowcol_to_a1(1, col_idx).rstrip("1")
+        rng_col = f"{col_letter}2:{col_letter}{n_rows}"
+        gs_call(sheet_u.update, rng_col, [["NAO"]] * (n_rows - 1))
+
+    return new_headers.index(PRIORIDADE_HEADER) + 1
+
+
+def prioridade_ativa(valor) -> bool:
+    """Converte o valor salvo na planilha em booleano."""
+    return str(valor or "").strip().upper() in {"SIM", "S", "TRUE", "VERDADEIRO", "1", "YES", "Y"}
+
+
+def obter_emails_prioridade(records_u) -> set:
+    """Retorna os e-mails dos usuários marcados com prioridade de embarque."""
+    emails = set()
+    for u in records_u or []:
+        if prioridade_ativa(u.get(PRIORIDADE_HEADER, "")):
+            email = str(u.get("Email", "") or u.get("EMAIL", "")).strip().lower()
+            if email:
+                emails.add(email)
+    return emails
+
+
+def colunas_para_exibir(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove colunas internas antes de mostrar a tabela na tela."""
+    ocultas = [c for c in ["EMAIL", "_PRIORIDADE_LISTA"] if c in df.columns]
+    return df.drop(columns=ocultas)
+
 
 def find_user_row_by_email_tel(sheet_u, email: str, tel_digits: str):
     email = str(email or "").strip().lower()
@@ -416,6 +467,7 @@ def arquivar_lista_antes_de_limpar(dados_p):
 
         ciclo_id, data_ciclo, embarque = identificar_ciclo_da_lista(dados_p)
         capacidade_onibus = buscar_capacidade_onibus_dinamica()
+        prioridade_emails = obter_emails_prioridade(buscar_usuarios_cadastrados())
 
         historico_atual = gs_call(sheet_h.get_all_values)
         if historico_atual and len(historico_atual) > 1:
@@ -428,6 +480,7 @@ def arquivar_lista_antes_de_limpar(dados_p):
         for row in dados_p[1:]:
             r = list(row) + [""] * 6
             r = r[:6]
+            email_linha = str(r[5] or "").strip().lower()
             linhas.append([
                 ciclo_id,
                 data_ciclo,
@@ -440,6 +493,7 @@ def arquivar_lista_antes_de_limpar(dados_p):
                 r[4],  # LOTAÇÃO
                 r[5],  # EMAIL
                 str(capacidade_onibus),  # CAPACIDADE_ONIBUS
+                "SIM" if email_linha in prioridade_emails else "NAO",  # PRIORIDADE_LISTA
             ])
 
         if linhas:
@@ -532,11 +586,20 @@ def obter_ciclo_atual():
     return alvo_h, alvo_dt_str
 
 
-def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS):
+def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS, prioridade_emails=None):
+    """
+    Ordena a lista e aplica a regra de prioridade:
+    - primeiro calcula a ordem normal;
+    - se usuário marcado como prioridade estiver como excedente, ele é deslocado para o final das vagas disponíveis;
+    - quando houver 2 ou mais nessa condição, mantém a ordem entre eles;
+    - usuários prioritários são destacados em azul/negrito na tabela.
+    """
     try:
         capacidade_onibus = max(1, int(capacidade_onibus))
     except Exception:
         capacidade_onibus = CAPACIDADE_PADRAO_ONIBUS
+
+    prioridade_emails = {str(e or "").strip().lower() for e in (prioridade_emails or set()) if str(e or "").strip()}
 
     if "EMAIL" not in df.columns:
         df["EMAIL"] = "N/A"
@@ -581,22 +644,74 @@ def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS):
     # Desempate por quem entrou primeiro
     df["dt"] = pd.to_datetime(df["DATA_HORA"], dayfirst=True, errors="coerce")
 
-    # Ordenação final conforme regra
+    # Ordenação final conforme regra original
     df = df.sort_values(by=["grupo_fc", "p_o", "p_g", "dt"]).reset_index(drop=True)
+    df["_PRIORIDADE_LISTA"] = df["EMAIL"].astype(str).str.strip().str.lower().isin(prioridade_emails)
+
+    # ==========================================================
+    # PRIORIDADE DE EMBARQUE
+    # ==========================================================
+    # Somente mexe se a pessoa prioritária estiver fora das vagas.
+    if len(df) > capacidade_onibus and prioridade_emails:
+        primeira_faixa = df.iloc[:capacidade_onibus].copy()
+        excedentes = df.iloc[capacidade_onibus:].copy()
+        prioridade_excedente = excedentes[excedentes["_PRIORIDADE_LISTA"]].copy()
+
+        if not prioridade_excedente.empty:
+            qtd_prioridade_excedente = len(prioridade_excedente)
+
+            # Posições finais disponíveis dentro das vagas, sem derrubar quem já é prioritário.
+            posicoes_substituir = []
+            for pos in range(len(primeira_faixa) - 1, -1, -1):
+                if not bool(primeira_faixa.iloc[pos].get("_PRIORIDADE_LISTA", False)):
+                    posicoes_substituir.append(pos)
+                    if len(posicoes_substituir) == qtd_prioridade_excedente:
+                        break
+
+            # Caso extremo: se a faixa de vagas estiver toda preenchida por prioritários,
+            # não há usuário comum a deslocar. Nesse caso, mantém a ordem calculada.
+            if len(posicoes_substituir) == qtd_prioridade_excedente:
+                posicoes_substituir = sorted(posicoes_substituir)
+
+                # Remove os prioritários excedentes da parte excedente para evitar duplicidade.
+                emails_mover = set(prioridade_excedente["EMAIL"].astype(str).str.strip().str.lower().tolist())
+                excedentes_sem_mover = excedentes[~excedentes["EMAIL"].astype(str).str.strip().str.lower().isin(emails_mover)].copy()
+
+                deslocados_para_excedente = []
+                prioridade_excedente = prioridade_excedente.reset_index(drop=True)
+
+                for ordem, pos in enumerate(posicoes_substituir):
+                    deslocados_para_excedente.append(primeira_faixa.iloc[pos].copy())
+                    primeira_faixa.iloc[pos] = prioridade_excedente.iloc[ordem]
+
+                df = pd.concat([
+                    primeira_faixa,
+                    pd.DataFrame(deslocados_para_excedente),
+                    excedentes_sem_mover
+                ], ignore_index=True)
 
     df.insert(0, "Nº", [str(i + 1) if i < capacidade_onibus else f"Exc-{i - capacidade_onibus + 1:02d}" for i in range(len(df))])
 
     # Remove primeiro as colunas auxiliares para evitar erro de dtype ao inserir HTML
-    df_final = df.drop(columns=["grupo_fc", "p_o", "p_g", "dt"]).copy()
+    df_final = df.drop(columns=["grupo_fc", "p_o", "p_g", "dt", PRIORIDADE_HEADER], errors="ignore").copy()
     df_v = df_final.copy()
 
     for i, r in df_v.iterrows():
-        if "Exc-" in str(r["Nº"]):
+        is_prioridade = bool(r.get("_PRIORIDADE_LISTA", False))
+        is_exc = "Exc-" in str(r.get("Nº", ""))
+
+        if is_prioridade:
             for c in df_v.columns:
+                if c == "_PRIORIDADE_LISTA":
+                    continue
+                df_v.at[i, c] = f"<span style='color:#1565c0; font-weight:bold;'>{r[c]}</span>"
+        elif is_exc:
+            for c in df_v.columns:
+                if c == "_PRIORIDADE_LISTA":
+                    continue
                 df_v.at[i, c] = f"<span style='color:#d32f2f; font-weight:bold;'>{r[c]}</span>"
 
     return df_final, df_v
-
 
 # ==========================================================
 # PDF “mais apresentado” (AGORA COM ORIGEM À DIREITA)
@@ -669,6 +784,8 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str
 
     for idx, (_, r) in enumerate(df_o.iterrows()):
         is_exc = "Exc-" in str(r.get("Nº", ""))
+        is_prioridade = bool(r.get("_PRIORIDADE_LISTA", False))
+
         if is_exc:
             pdf.set_fill_color(255, 235, 238)
         else:
@@ -676,6 +793,13 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str
                 pdf.set_fill_color(245, 245, 245)
             else:
                 pdf.set_fill_color(255, 255, 255)
+
+        if is_prioridade:
+            pdf.set_font("Arial", "B", 8)
+            pdf.set_text_color(21, 101, 192)
+        else:
+            pdf.set_font("Arial", "", 8)
+            pdf.set_text_color(0, 0, 0)
 
         origem = str(r.get("QG_RMCF_OUTROS", "") or r.get("ORIGEM", "") or "").strip()
 
@@ -685,6 +809,9 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str
         pdf.cell(col_w[3], 6, str(r.get("LOTAÇÃO", ""))[:34], border=0, fill=True)
         pdf.cell(col_w[4], 6, origem[:10], border=0, align="C", fill=True)
         pdf.ln()
+
+    pdf.set_font("Arial", "", 8)
+    pdf.set_text_color(0, 0, 0)
 
     pdf.ln(4)
     pdf.set_font("Arial", "I", 8)
@@ -771,13 +898,21 @@ def render_historico_page():
 
     df_base = df_ciclo[["DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"]].copy()
 
+    prioridade_hist_emails = set()
+    if PRIORIDADE_HEADER in df_ciclo.columns:
+        df_base[PRIORIDADE_HEADER] = df_ciclo[PRIORIDADE_HEADER].fillna("")
+        prioridade_hist_emails = set(
+            df_base.loc[df_base[PRIORIDADE_HEADER].apply(prioridade_ativa), "EMAIL"]
+            .astype(str).str.strip().str.lower().tolist()
+        )
+
     capacidade_hist = CAPACIDADE_PADRAO_ONIBUS
     if "CAPACIDADE_ONIBUS" in df_ciclo.columns:
         cap_vals = pd.to_numeric(df_ciclo["CAPACIDADE_ONIBUS"], errors="coerce").dropna()
         if not cap_vals.empty:
             capacidade_hist = max(1, int(cap_vals.iloc[0]))
 
-    df_o_hist, df_v_hist = aplicar_ordenacao(df_base, capacidade_hist)
+    df_o_hist, df_v_hist = aplicar_ordenacao(df_base, capacidade_hist, prioridade_hist_emails)
 
     insc = len(df_o_hist)
     rest_hist = capacidade_hist - insc
@@ -789,7 +924,7 @@ def render_historico_page():
 
     st.write(
         f"<div class='tabela-responsiva'>"
-        f"{df_v_show.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
+        f"{colunas_para_exibir(df_v_show).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
         f"</div>",
         unsafe_allow_html=True
     )
@@ -873,17 +1008,20 @@ if "_confirmar_exclusao_presenca" not in st.session_state:
     st.session_state._confirmar_exclusao_presenca = False
 
 try:
-    # Leitura leve pro público
-    records_u_public = buscar_usuarios_cadastrados()
-    limite_max = buscar_limite_dinamico()
-    capacidade_onibus = buscar_capacidade_onibus_dinamica()
     sheet_u_escrita = ws_usuarios()
 
-    # Garante colunas TEMP_* para recuperação segura
+    # Garante colunas auxiliares da aba Usuarios antes das leituras cacheadas.
     try:
         ensure_temp_cols(sheet_u_escrita)
+        ensure_prioridade_col(sheet_u_escrita)
     except Exception:
         pass
+
+    # Leitura leve pro público
+    records_u_public = buscar_usuarios_cadastrados()
+    emails_prioridade_lista = obter_emails_prioridade(records_u_public)
+    limite_max = buscar_limite_dinamico()
+    capacidade_onibus = buscar_capacidade_onibus_dinamica()
 
     # =========================================
     # LOGIN / CADASTRO / INSTRUÇÕES / RECUPERAR / ADM
@@ -1134,6 +1272,11 @@ try:
             buscar_usuarios_admin.clear()
             st.session_state._adm_first_load = False
 
+        try:
+            prioridade_col_idx = ensure_prioridade_col(sheet_u_escrita)
+        except Exception:
+            prioridade_col_idx = None
+
         records_u = buscar_usuarios_admin()
 
         cA, cB = st.columns([1, 1])
@@ -1186,10 +1329,12 @@ try:
         for i, user in enumerate(records_u):
             if busca == "" or busca in str(user.get("Nome", "")).lower() or busca in str(user.get("Email", "")).lower():
                 status = str(user.get("STATUS", "")).upper()
-                with st.expander(f"{user.get('Graduação')} {user.get('Nome')} - {status}"):
-                    c1, c2, c3 = st.columns([2, 1, 1])
+                pri_txt = " | PRIORIDADE" if prioridade_ativa(user.get(PRIORIDADE_HEADER, "")) else ""
+                with st.expander(f"{user.get('Graduação')} {user.get('Nome')} - {status}{pri_txt}"):
+                    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
                     c1.write(f"📧 {user.get('Email')} | 📱 {user.get('TELEFONE')}")
                     is_ativo = (status == "ATIVO")
+                    is_prioridade = prioridade_ativa(user.get(PRIORIDADE_HEADER, ""))
 
                     new_val = c2.checkbox("Liberar", value=is_ativo, key=f"adm_chk_{i}")
                     if new_val != is_ativo:
@@ -1198,7 +1343,16 @@ try:
                         buscar_usuarios_cadastrados.clear()
                         st.rerun()
 
-                    del_btn = c3.button("🗑️", key=f"del_{i}")
+                    pri_val = c3.checkbox("Prioridade", value=is_prioridade, key=f"adm_pri_{i}")
+                    if pri_val != is_prioridade:
+                        if prioridade_col_idx is None:
+                            prioridade_col_idx = ensure_prioridade_col(sheet_u_escrita)
+                        gs_call(sheet_u_escrita.update_cell, i + 2, prioridade_col_idx, "SIM" if pri_val else "NAO")
+                        buscar_usuarios_admin.clear()
+                        buscar_usuarios_cadastrados.clear()
+                        st.rerun()
+
+                    del_btn = c4.button("🗑️", key=f"del_{i}")
                     if del_btn:
                         gs_call(sheet_u_escrita.delete_rows, i + 2)
                         buscar_usuarios_admin.clear()
@@ -1379,7 +1533,7 @@ try:
         ja, pos = False, 999
 
         if dados_p_show and len(dados_p_show) > 1:
-            df_o, df_v = aplicar_ordenacao(pd.DataFrame(dados_p_show[1:], columns=dados_p_show[0]), capacidade_onibus)
+            df_o, df_v = aplicar_ordenacao(pd.DataFrame(dados_p_show[1:], columns=dados_p_show[0]), capacidade_onibus, emails_prioridade_lista)
             email_logado = str(u.get("Email")).strip().lower()
             ja = any(email_logado == str(row.get("EMAIL", "")).strip().lower() for _, row in df_o.iterrows())
             if ja:
@@ -1488,7 +1642,7 @@ try:
 
             st.write(
                 f"<div class='tabela-responsiva'>"
-                f"{df_v_show.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
+                f"{colunas_para_exibir(df_v_show).to_html(index=False, justify='center', border=0, escape=False, classes='presenca-zebra')}"
                 f"</div>",
                 unsafe_allow_html=True
             )
