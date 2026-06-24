@@ -823,6 +823,144 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str
 
 
 # ==========================================================
+# PDF ADM: RELAÇÃO DE USUÁRIOS CADASTRADOS
+# ==========================================================
+def ordenar_usuarios_para_relatorio(records_u):
+    """
+    Monta e ordena a relação de usuários cadastrados usando a mesma base
+    de prioridade da lista de passageiros:
+    - Origem: QG -> RMCF -> OUTROS;
+    - Graduação: TCEL -> MAJ -> CAP -> ... -> SD;
+    - FC COM e FC TER seguem a mesma chave de grupo usada na lista atual;
+    - Empate: ordem de cadastro na planilha.
+    """
+    linhas = []
+    for ordem, user in enumerate(records_u or []):
+        grad = str(user.get("Graduação", "") or user.get("GRADUAÇÃO", "")).strip()
+        nome = str(user.get("Nome", "") or user.get("NOME", "")).strip()
+        lotacao = str(user.get("Lotação", "") or user.get("LOTAÇÃO", "")).strip()
+        origem = str(
+            user.get("QG_RMCF_OUTROS", "")
+            or user.get("ORIGEM", "")
+            or user.get("Origem", "")
+        ).strip().upper()
+        telefone = tel_format_br(str(user.get("TELEFONE", "") or user.get("Telefone", "") or ""))
+
+        linhas.append({
+            "GRADUAÇÃO": grad,
+            "NOME": nome,
+            "LOTAÇÃO": lotacao,
+            "ORIGEM": origem,
+            "TELEFONE": telefone,
+            "_ORDEM_CADASTRO": ordem,
+            "_PRIORIDADE_LISTA": prioridade_ativa(user.get(PRIORIDADE_HEADER, "")),
+        })
+
+    df = pd.DataFrame(linhas)
+    if df.empty:
+        return df
+
+    p_orig = {"QG": 1, "RMCF": 2, "OUTROS": 3}
+    p_grad_normal = {
+        "TCEL": 1, "MAJ": 2, "CAP": 3, "1º TEN": 4, "2º TEN": 5, "SUBTEN": 6,
+        "1º SGT": 7, "2º SGT": 8, "3º SGT": 9, "CB": 10, "SD": 11
+    }
+
+    def grupo_fc(grad):
+        g = str(grad or "").strip().upper()
+        if g == "FC COM":
+            return 1
+        if g == "FC TER":
+            return 2
+        return 0
+
+    df["grupo_fc"] = df["GRADUAÇÃO"].apply(grupo_fc)
+    df["p_o"] = df["ORIGEM"].map(p_orig).fillna(99)
+
+    def p_grad(row):
+        if int(row.get("grupo_fc", 0)) == 0:
+            return p_grad_normal.get(str(row.get("GRADUAÇÃO", "")).strip().upper(), 999)
+        return 0
+
+    df["p_g"] = df.apply(p_grad, axis=1)
+    df = df.sort_values(by=["grupo_fc", "p_o", "p_g", "_ORDEM_CADASTRO"]).reset_index(drop=True)
+    df.insert(0, "Nº", [str(i + 1) for i in range(len(df))])
+    return df.drop(columns=["grupo_fc", "p_o", "p_g"], errors="ignore")
+
+
+def gerar_pdf_usuarios_admin(records_u) -> bytes:
+    """Gera PDF com todos os usuários cadastrados para download no painel ADM."""
+    agora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+    pdf = PDFRelatorio(
+        titulo="ROTA NOVA IGUAÇU - USUÁRIOS CADASTRADOS",
+        sub=f"Emitido em: {agora} | Ordenado pela mesma lógica da lista de passageiros"
+    )
+    pdf.add_page()
+
+    df_u = ordenar_usuarios_para_relatorio(records_u)
+
+    pdf.set_font("Arial", "B", 10)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(0, 8, "RESUMO", ln=True, fill=True)
+
+    total = len(df_u) if df_u is not None else 0
+    total_prioridade = 0
+    if df_u is not None and not df_u.empty and "_PRIORIDADE_LISTA" in df_u.columns:
+        total_prioridade = int(df_u["_PRIORIDADE_LISTA"].fillna(False).astype(bool).sum())
+
+    pdf.set_font("Arial", "", 9)
+    pdf.cell(0, 6, f"Total de usuários cadastrados: {total} | Com prioridade: {total_prioridade}", ln=True)
+    pdf.ln(2)
+
+    headers = ["Nº", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "ORIGEM", "TELEFONE"]
+    col_w = [10, 24, 62, 45, 19, 30]
+
+    pdf.set_font("Arial", "B", 8)
+    pdf.set_fill_color(30, 30, 30)
+    pdf.set_text_color(255, 255, 255)
+    for i, h in enumerate(headers):
+        pdf.cell(col_w[i], 7, h, border=0, align="C", fill=True)
+    pdf.ln()
+
+    if df_u is not None and not df_u.empty:
+        for idx, (_, r) in enumerate(df_u.iterrows()):
+            if idx % 2 == 0:
+                pdf.set_fill_color(245, 245, 245)
+            else:
+                pdf.set_fill_color(255, 255, 255)
+
+            is_prioridade = bool(r.get("_PRIORIDADE_LISTA", False))
+            if is_prioridade:
+                pdf.set_font("Arial", "B", 8)
+                pdf.set_text_color(21, 101, 192)
+            else:
+                pdf.set_font("Arial", "", 8)
+                pdf.set_text_color(0, 0, 0)
+
+            pdf.cell(col_w[0], 6, str(r.get("Nº", "")), border=0, align="C", fill=True)
+            pdf.cell(col_w[1], 6, str(r.get("GRADUAÇÃO", ""))[:12], border=0, fill=True)
+            pdf.cell(col_w[2], 6, str(r.get("NOME", ""))[:36], border=0, fill=True)
+            pdf.cell(col_w[3], 6, str(r.get("LOTAÇÃO", ""))[:25], border=0, fill=True)
+            pdf.cell(col_w[4], 6, str(r.get("ORIGEM", ""))[:10], border=0, align="C", fill=True)
+            pdf.cell(col_w[5], 6, str(r.get("TELEFONE", ""))[:18], border=0, align="C", fill=True)
+            pdf.ln()
+    else:
+        pdf.set_font("Arial", "I", 9)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(0, 8, "Nenhum usuário cadastrado encontrado.", ln=True)
+
+    pdf.set_font("Arial", "", 8)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+    pdf.set_font("Arial", "I", 8)
+    pdf.set_text_color(80, 80, 80)
+    pdf.multi_cell(0, 5, "Observação: usuários em azul/negrito possuem prioridade de embarque na lista de passageiros.")
+    pdf.set_text_color(0, 0, 0)
+
+    return pdf.output(dest="S").encode("latin-1")
+
+
+# ==========================================================
 # TELA DO HISTÓRICO
 # ==========================================================
 def render_historico_page():
@@ -1312,6 +1450,20 @@ try:
 
         st.divider()
         st.subheader("👥 Gestão de Usuários")
+
+        c_pdf_users, c_pdf_info = st.columns([1, 1])
+        with c_pdf_users:
+            pdf_usuarios = gerar_pdf_usuarios_admin(records_u)
+            st.download_button(
+                "📄 PDF DOS USUÁRIOS CADASTRADOS",
+                pdf_usuarios,
+                "usuarios_cadastrados_rota_nova_iguacu.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
+        with c_pdf_info:
+            st.caption("Gera Graduação, Nome, Lotação, Origem e Telefone na ordem usada pela lista.")
+
         busca = st.text_input("🔍 Pesquisar por Nome ou E-mail:").strip().lower()
 
         ativar_all = st.button("✅ ATIVAR TODOS E DESLOGAR", use_container_width=True)
