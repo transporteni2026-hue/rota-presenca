@@ -24,6 +24,9 @@ WS_USUARIOS = "Usuarios"
 WS_CONFIG = "Config"
 WS_HISTORICO = "Historico"
 
+# Capacidade padrão usada quando a Config ainda não tiver valor definido pelo ADM.
+CAPACIDADE_PADRAO_ONIBUS = 38
+
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
 
 # ==========================================================
@@ -123,7 +126,7 @@ def ws_config():
         return gs_call(doc.worksheet, WS_CONFIG)
     except Exception:
         sheet_c = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
-        gs_call(sheet_c.update, "A1:A2", [["LIMITE"], ["100"]])
+        gs_call(sheet_c.update, "A1:B2", [["LIMITE", "CAPACIDADE_ONIBUS"], ["100", str(CAPACIDADE_PADRAO_ONIBUS)]])
         return sheet_c
 
 @st.cache_resource
@@ -149,7 +152,8 @@ TEMP_HEADERS = ["TEMP_SENHA", "TEMP_EXPIRA", "TEMP_USADA"]
 # Cabeçalho da aba Historico, criada automaticamente no Google Sheets
 HIST_HEADERS = [
     "CICLO_ID", "DATA_CICLO", "EMBARQUE", "ARQUIVADO_EM",
-    "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"
+    "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL",
+    "CAPACIDADE_ONIBUS"
 ]
 
 def _br_now():
@@ -250,6 +254,25 @@ def buscar_usuarios_admin():
     except Exception:
         return []
 
+def garantir_config_capacidade(sheet_c):
+    """
+    Garante que a aba Config tenha também o campo CAPACIDADE_ONIBUS.
+    Mantém o limite de usuários no padrão atual:
+    A1 = LIMITE | A2 = valor
+    B1 = CAPACIDADE_ONIBUS | B2 = valor
+    """
+    try:
+        cabecalho = gs_call(sheet_c.row_values, 1)
+        b1 = str(cabecalho[1]).strip() if len(cabecalho) > 1 else ""
+        if b1 != "CAPACIDADE_ONIBUS":
+            gs_call(sheet_c.update, "B1:B2", [["CAPACIDADE_ONIBUS"], [str(CAPACIDADE_PADRAO_ONIBUS)]])
+    except Exception:
+        try:
+            gs_call(sheet_c.update, "B1:B2", [["CAPACIDADE_ONIBUS"], [str(CAPACIDADE_PADRAO_ONIBUS)]])
+        except Exception:
+            pass
+
+
 @st.cache_data(ttl=120)
 def buscar_limite_dinamico():
     try:
@@ -258,6 +281,22 @@ def buscar_limite_dinamico():
         return int(val)
     except Exception:
         return 100
+
+
+@st.cache_data(ttl=30)
+def buscar_capacidade_onibus_dinamica():
+    """
+    Capacidade usada para definir quem fica numerado como vaga normal
+    e quem passa a aparecer como Exc-xx.
+    """
+    try:
+        sheet_c = ws_config()
+        garantir_config_capacidade(sheet_c)
+        val = gs_call(sheet_c.acell, "B2").value
+        capacidade = int(str(val).strip())
+        return max(1, capacidade)
+    except Exception:
+        return CAPACIDADE_PADRAO_ONIBUS
 
 @st.cache_data(ttl=6)
 def buscar_presenca_atualizada():
@@ -376,6 +415,7 @@ def arquivar_lista_antes_de_limpar(dados_p):
         ensure_historico_headers(sheet_h)
 
         ciclo_id, data_ciclo, embarque = identificar_ciclo_da_lista(dados_p)
+        capacidade_onibus = buscar_capacidade_onibus_dinamica()
 
         historico_atual = gs_call(sheet_h.get_all_values)
         if historico_atual and len(historico_atual) > 1:
@@ -399,6 +439,7 @@ def arquivar_lista_antes_de_limpar(dados_p):
                 r[3],  # NOME
                 r[4],  # LOTAÇÃO
                 r[5],  # EMAIL
+                str(capacidade_onibus),  # CAPACIDADE_ONIBUS
             ])
 
         if linhas:
@@ -491,7 +532,12 @@ def obter_ciclo_atual():
     return alvo_h, alvo_dt_str
 
 
-def aplicar_ordenacao(df):
+def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS):
+    try:
+        capacidade_onibus = max(1, int(capacidade_onibus))
+    except Exception:
+        capacidade_onibus = CAPACIDADE_PADRAO_ONIBUS
+
     if "EMAIL" not in df.columns:
         df["EMAIL"] = "N/A"
 
@@ -538,7 +584,7 @@ def aplicar_ordenacao(df):
     # Ordenação final conforme regra
     df = df.sort_values(by=["grupo_fc", "p_o", "p_g", "dt"]).reset_index(drop=True)
 
-    df.insert(0, "Nº", [str(i + 1) if i < 38 else f"Exc-{i - 37:02d}" for i in range(len(df))])
+    df.insert(0, "Nº", [str(i + 1) if i < capacidade_onibus else f"Exc-{i - capacidade_onibus + 1:02d}" for i in range(len(df))])
 
     # Remove primeiro as colunas auxiliares para evitar erro de dtype ao inserir HTML
     df_final = df.drop(columns=["grupo_fc", "p_o", "p_g", "dt"]).copy()
@@ -599,7 +645,7 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str
 
     pdf.set_font("Arial", "", 9)
     insc = resumo.get("inscritos", 0)
-    vagas = resumo.get("vagas", 38)
+    vagas = resumo.get("vagas", CAPACIDADE_PADRAO_ONIBUS)
     exc = max(0, insc - vagas)
     sobra = max(0, vagas - insc)
 
@@ -643,7 +689,7 @@ def gerar_pdf_apresentado(df_o: pd.DataFrame, resumo: dict, subtitulo_extra: str
     pdf.ln(4)
     pdf.set_font("Arial", "I", 8)
     pdf.set_text_color(80, 80, 80)
-    pdf.multi_cell(0, 5, "Observação: os itens marcados como 'Exc-xx' representam excedentes além do limite de 38 vagas.")
+    pdf.multi_cell(0, 5, "Observação: os itens marcados como 'Exc-xx' representam excedentes além da capacidade configurada para o ônibus.")
     pdf.set_text_color(0, 0, 0)
 
     return pdf.output(dest="S").encode("latin-1")
@@ -663,7 +709,15 @@ def render_historico_page():
 
     headers = list(dados_h[0])
     rows = dados_h[1:]
-    df_h = pd.DataFrame(rows, columns=headers)
+    rows_norm = []
+    for r in rows:
+        rr = list(r)
+        if len(rr) < len(headers):
+            rr = rr + [""] * (len(headers) - len(rr))
+        elif len(rr) > len(headers):
+            rr = rr[:len(headers)]
+        rows_norm.append(rr)
+    df_h = pd.DataFrame(rows_norm, columns=headers)
 
     # Garante as colunas esperadas mesmo se a aba tiver sido criada manualmente com algo faltando.
     for col in HIST_HEADERS:
@@ -716,10 +770,18 @@ def render_historico_page():
         return
 
     df_base = df_ciclo[["DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"]].copy()
-    df_o_hist, df_v_hist = aplicar_ordenacao(df_base)
+
+    capacidade_hist = CAPACIDADE_PADRAO_ONIBUS
+    if "CAPACIDADE_ONIBUS" in df_ciclo.columns:
+        cap_vals = pd.to_numeric(df_ciclo["CAPACIDADE_ONIBUS"], errors="coerce").dropna()
+        if not cap_vals.empty:
+            capacidade_hist = max(1, int(cap_vals.iloc[0]))
+
+    df_o_hist, df_v_hist = aplicar_ordenacao(df_base, capacidade_hist)
 
     insc = len(df_o_hist)
-    st.subheader(f"Inscritos: {insc} | Vagas: 38 | {'Sobra' if 38 - insc >= 0 else 'Exc'}: {abs(38 - insc)}")
+    rest_hist = capacidade_hist - insc
+    st.subheader(f"Inscritos: {insc} | Vagas: {capacidade_hist} | {'Sobra' if rest_hist >= 0 else 'Exc'}: {abs(rest_hist)}")
 
     df_v_show = df_v_hist.copy()
     if "NOME" in df_v_show.columns:
@@ -735,7 +797,7 @@ def render_historico_page():
     data_ciclo_pdf = str(df_ciclo["DATA_CICLO"].iloc[0]).strip()
     embarque_pdf = str(df_ciclo["EMBARQUE"].iloc[0]).strip()
     subtitulo = f"Histórico: EMBARQUE {embarque_pdf}h do dia {data_ciclo_pdf}"
-    resumo = {"inscritos": insc, "vagas": 38}
+    resumo = {"inscritos": insc, "vagas": capacidade_hist}
     pdf_bytes = gerar_pdf_apresentado(df_o_hist, resumo, subtitulo_extra=subtitulo)
 
     nome_pdf = f"historico_rota_nova_iguacu_{ciclo_escolhido}.pdf"
@@ -814,6 +876,7 @@ try:
     # Leitura leve pro público
     records_u_public = buscar_usuarios_cadastrados()
     limite_max = buscar_limite_dinamico()
+    capacidade_onibus = buscar_capacidade_onibus_dinamica()
     sheet_u_escrita = ws_usuarios()
 
     # Garante colunas TEMP_* para recuperação segura
@@ -1000,6 +1063,7 @@ try:
             **2. Observação:**
             * Nos períodos em que a lista ficar suspensa para conferência (05:00h às 07:00h / 17:00h às 19:00h), os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
             * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Antes de ser zerada, a lista anterior será arquivada automaticamente na aba **Histórico**, onde poderá ser consultada por data e baixada em PDF.
+            * A quantidade de vagas consideradas como "normais" é definida pelo Administrador no painel ADM, no campo **Capacidade do ônibus**. Quem ultrapassar essa capacidade aparecerá como **Exc-xx**.
             """)
 
         with t4:
@@ -1082,12 +1146,25 @@ try:
             st.caption("ADM lê mais fresco (TTL=3s).")
 
         st.subheader("⚙️ Configurações Globais")
-        novo_limite = st.number_input("Limite máximo de usuários:", value=int(limite_max))
-        salvar_lim = st.button("💾 SALVAR NOVO LIMITE")
+        c_cfg1, c_cfg2 = st.columns([1, 1])
+        with c_cfg1:
+            novo_limite = st.number_input("Limite máximo de usuários cadastrados:", min_value=1, value=int(limite_max), step=1)
+        with c_cfg2:
+            nova_capacidade_onibus = st.number_input(
+                "Capacidade do ônibus (vagas antes de excedente):",
+                min_value=1,
+                max_value=200,
+                value=int(capacidade_onibus),
+                step=1
+            )
+
+        salvar_lim = st.button("💾 SALVAR CONFIGURAÇÕES")
         if salvar_lim:
             sheet_c = ws_config()
-            gs_call(sheet_c.update, "A2", [[str(novo_limite)]])
-            st.success("Limite atualizado!")
+            gs_call(sheet_c.update, "A1:B2", [["LIMITE", "CAPACIDADE_ONIBUS"], [str(int(novo_limite)), str(int(nova_capacidade_onibus))]])
+            buscar_limite_dinamico.clear()
+            buscar_capacidade_onibus_dinamica.clear()
+            st.success("Configurações atualizadas!")
             st.rerun()
 
         st.divider()
@@ -1302,14 +1379,15 @@ try:
         ja, pos = False, 999
 
         if dados_p_show and len(dados_p_show) > 1:
-            df_o, df_v = aplicar_ordenacao(pd.DataFrame(dados_p_show[1:], columns=dados_p_show[0]))
+            df_o, df_v = aplicar_ordenacao(pd.DataFrame(dados_p_show[1:], columns=dados_p_show[0]), capacidade_onibus)
             email_logado = str(u.get("Email")).strip().lower()
             ja = any(email_logado == str(row.get("EMAIL", "")).strip().lower() for _, row in df_o.iterrows())
             if ja:
-                pos = df_o.index[df_o["EMAIL"].str.lower() == email_logado].tolist()[0] + 1
+                pos_idx = df_o.index[df_o["EMAIL"].str.lower() == email_logado].tolist()[0]
+                pos = str(df_o.loc[pos_idx, "Nº"])
 
         if ja:
-            st.success(f"✅ Presença registrada: {pos}º")
+            st.success(f"✅ Presença registrada: {pos}")
 
             # ==========================================================
             # ALTERAÇÃO SOLICITADA: confirmação antes de excluir
@@ -1387,8 +1465,8 @@ try:
 
         if dados_p_show and len(dados_p_show) > 1:
             insc = len(df_o)
-            rest = 38 - insc
-            st.subheader(f"Inscritos: {insc} | Vagas: 38 | {'Sobra' if rest >= 0 else 'Exc'}: {abs(rest)}")
+            rest = capacidade_onibus - insc
+            st.subheader(f"Inscritos: {insc} | Vagas: {capacidade_onibus} | {'Sobra' if rest >= 0 else 'Exc'}: {abs(rest)}")
 
             c_up1, c_up2 = st.columns([1, 1])
             with c_up1:
@@ -1417,7 +1495,7 @@ try:
 
             c1, c2 = st.columns(2)
             with c1:
-                resumo = {"inscritos": insc, "vagas": 38}
+                resumo = {"inscritos": insc, "vagas": capacidade_onibus}
                 pdf_bytes = gerar_pdf_apresentado(df_o, resumo)
                 _ = st.download_button(
                     "📄 PDF (Relatório)",
