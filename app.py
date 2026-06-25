@@ -1429,7 +1429,7 @@ try:
                     senha_digitada = str(ad_s or "")
 
                     # ADM mestre: mantém o acesso antigo, com todas as permissões.
-                    if usuario_digitado == "123" and senha_digitada == "123":
+                    if usuario_digitado == "@" and senha_digitada == "@":
                         st.session_state.is_admin = True
                         st.session_state._admin_master = True
                         st.session_state._adm_first_load = True
@@ -1554,11 +1554,25 @@ try:
                 st.rerun()
 
         for i, user in enumerate(records_u):
-            if busca == "" or busca in str(user.get("Nome", "")).lower() or busca in str(user.get("Email", "")).lower():
+            nome_user = str(user.get("Nome", "") or "").strip()
+            email_user = str(user.get("Email", "") or "").strip()
+            grad_user = str(user.get("Graduação", "") or "").strip()
+            lot_user = str(user.get("Lotação", "") or "").strip()
+            orig_user = str(user.get("QG_RMCF_OUTROS", "") or user.get("ORIGEM", "") or "").strip()
+
+            # A pesquisa continua buscando por nome/e-mail e também passa a encontrar por lotação/origem.
+            texto_busca_user = f"{nome_user} {email_user} {lot_user} {orig_user}".lower()
+
+            if busca == "" or busca in texto_busca_user:
                 status = str(user.get("STATUS", "")).upper()
                 pri_txt = " | PRIORIDADE" if prioridade_ativa(user.get(PRIORIDADE_HEADER, "")) else ""
                 adm_txt = " | ADM" if (is_admin_master and admin_acesso_ativo(user.get(ADMIN_HEADER, ""))) else ""
-                with st.expander(f"{user.get('Graduação')} {user.get('Nome')} - {status}{pri_txt}{adm_txt}"):
+
+                lot_exibir = lot_user if lot_user else "Sem lotação"
+                orig_exibir = orig_user if orig_user else "Sem origem"
+                titulo_usuario = f"{grad_user} {nome_user} | {lot_exibir} | {orig_exibir} - {status}{pri_txt}{adm_txt}"
+
+                with st.expander(titulo_usuario):
                     if is_admin_master:
                         c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
                     else:
