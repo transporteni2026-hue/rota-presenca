@@ -30,6 +30,10 @@ CAPACIDADE_PADRAO_ONIBUS = 38
 # Campo criado automaticamente na aba Usuarios para marcar quem possui prioridade de embarque.
 PRIORIDADE_HEADER = "PRIORIDADE_LISTA"
 
+# Campo criado automaticamente na aba Usuarios para liberar acesso ao painel ADM com login próprio.
+# O acesso mestre @/@ continua existindo e é o único que pode alterar esta permissão.
+ADMIN_HEADER = "ACESSO_ADM"
+
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
 
 # ==========================================================
@@ -234,6 +238,37 @@ def ensure_prioridade_col(sheet_u):
 
 def prioridade_ativa(valor) -> bool:
     """Converte o valor salvo na planilha em booleano."""
+    return str(valor or "").strip().upper() in {"SIM", "S", "TRUE", "VERDADEIRO", "1", "YES", "Y"}
+
+
+def ensure_admin_col(sheet_u):
+    """
+    Garante a coluna ACESSO_ADM na aba Usuarios.
+    Valores esperados: SIM ou NAO.
+    Somente o ADM mestre @/@ deve alterar essa coluna pela interface.
+    """
+    headers = gs_call(sheet_u.row_values, 1)
+    headers = [str(h).strip() for h in headers if str(h).strip() != ""]
+
+    if ADMIN_HEADER in headers:
+        return headers.index(ADMIN_HEADER) + 1
+
+    new_headers = headers + [ADMIN_HEADER]
+    gs_call(sheet_u.update, "A1", [new_headers])
+
+    rows = gs_call(sheet_u.get_all_values)
+    n_rows = len(rows)
+    if n_rows >= 2:
+        col_idx = new_headers.index(ADMIN_HEADER) + 1
+        col_letter = gspread.utils.rowcol_to_a1(1, col_idx).rstrip("1")
+        rng_col = f"{col_letter}2:{col_letter}{n_rows}"
+        gs_call(sheet_u.update, rng_col, [["NAO"]] * (n_rows - 1))
+
+    return new_headers.index(ADMIN_HEADER) + 1
+
+
+def admin_acesso_ativo(valor) -> bool:
+    """Converte o valor salvo na planilha em permissão de acesso ADM."""
     return str(valor or "").strip().upper() in {"SIM", "S", "TRUE", "VERDADEIRO", "1", "YES", "Y"}
 
 
@@ -1119,6 +1154,8 @@ if "usuario_logado" not in st.session_state:
     st.session_state.usuario_logado = None
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+if "_admin_master" not in st.session_state:
+    st.session_state._admin_master = False
 
 # (antes era _force_password_change; agora existe o novo fluxo de atualização completa)
 if "_force_profile_update" not in st.session_state:
@@ -1152,6 +1189,7 @@ try:
     try:
         ensure_temp_cols(sheet_u_escrita)
         ensure_prioridade_col(sheet_u_escrita)
+        ensure_admin_col(sheet_u_escrita)
     except Exception:
         pass
 
@@ -1383,16 +1421,40 @@ try:
 
         with t5:
             with st.form("form_admin"):
-                ad_u = st.text_input("Usuário ADM:")
+                ad_u = st.text_input("Usuário ADM ou E-mail autorizado:")
                 ad_s = st.text_input("Senha ADM:", type="password")
                 entrou_adm = st.form_submit_button("☠️ ACESSAR PAINEL ☠️")
                 if entrou_adm:
-                    if ad_u == "@" and ad_s == "@":
+                    usuario_digitado = str(ad_u or "").strip()
+                    senha_digitada = str(ad_s or "")
+
+                    # ADM mestre: mantém o acesso antigo, com todas as permissões.
+                    if usuario_digitado == "@" and senha_digitada == "@":
                         st.session_state.is_admin = True
+                        st.session_state._admin_master = True
                         st.session_state._adm_first_load = True
                         st.rerun()
                     else:
-                        st.error("ADM inválido.")
+                        # ADM autorizado: entra com o próprio e-mail e senha,
+                        # desde que esteja ATIVO e marcado em ACESSO_ADM.
+                        email_adm = usuario_digitado.lower()
+                        adm_user = next(
+                            (u for u in records_u_public
+                             if str(u.get("Email", "")).strip().lower() == email_adm
+                             and str(u.get("Senha", "")) == senha_digitada
+                             and str(u.get("STATUS", "")).strip().upper() == "ATIVO"
+                             and admin_acesso_ativo(u.get(ADMIN_HEADER, ""))),
+                            None
+                        )
+
+                        if adm_user:
+                            st.session_state.is_admin = True
+                            st.session_state._admin_master = False
+                            st.session_state._adm_first_load = True
+                            st.session_state._admin_user_email = str(adm_user.get("Email", "")).strip().lower()
+                            st.rerun()
+                        else:
+                            st.error("ADM inválido ou sem permissão de acesso ao painel.")
 
     # =========================================
     # PAINEL ADM
@@ -1403,6 +1465,8 @@ try:
         sair_btn = st.button("⬅️ SAIR DO PAINEL")
         if sair_btn:
             st.session_state.is_admin = False
+            st.session_state._admin_master = False
+            st.session_state._admin_user_email = ""
             st.session_state._adm_first_load = False
             st.rerun()
 
@@ -1410,10 +1474,16 @@ try:
             buscar_usuarios_admin.clear()
             st.session_state._adm_first_load = False
 
+        is_admin_master = bool(st.session_state.get("_admin_master", False))
         try:
             prioridade_col_idx = ensure_prioridade_col(sheet_u_escrita)
         except Exception:
             prioridade_col_idx = None
+
+        try:
+            admin_col_idx = ensure_admin_col(sheet_u_escrita)
+        except Exception:
+            admin_col_idx = None
 
         records_u = buscar_usuarios_admin()
 
@@ -1425,6 +1495,11 @@ try:
                 st.rerun()
         with cB:
             st.caption("ADM lê mais fresco (TTL=3s).")
+
+        if is_admin_master:
+            st.success("Acesso ADM mestre: todas as permissões liberadas, inclusive conceder/remover acesso ADM.")
+        else:
+            st.info("Acesso ADM autorizado: painel liberado, exceto conceder/remover acesso ADM de usuários.")
 
         st.subheader("⚙️ Configurações Globais")
         c_cfg1, c_cfg2 = st.columns([1, 1])
@@ -1482,11 +1557,17 @@ try:
             if busca == "" or busca in str(user.get("Nome", "")).lower() or busca in str(user.get("Email", "")).lower():
                 status = str(user.get("STATUS", "")).upper()
                 pri_txt = " | PRIORIDADE" if prioridade_ativa(user.get(PRIORIDADE_HEADER, "")) else ""
-                with st.expander(f"{user.get('Graduação')} {user.get('Nome')} - {status}{pri_txt}"):
-                    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+                adm_txt = " | ADM" if (is_admin_master and admin_acesso_ativo(user.get(ADMIN_HEADER, ""))) else ""
+                with st.expander(f"{user.get('Graduação')} {user.get('Nome')} - {status}{pri_txt}{adm_txt}"):
+                    if is_admin_master:
+                        c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
+                    else:
+                        c1, c2, c3, c5 = st.columns([2, 1, 1, 1])
+
                     c1.write(f"📧 {user.get('Email')} | 📱 {user.get('TELEFONE')}")
                     is_ativo = (status == "ATIVO")
                     is_prioridade = prioridade_ativa(user.get(PRIORIDADE_HEADER, ""))
+                    is_acesso_adm = admin_acesso_ativo(user.get(ADMIN_HEADER, ""))
 
                     new_val = c2.checkbox("Liberar", value=is_ativo, key=f"adm_chk_{i}")
                     if new_val != is_ativo:
@@ -1504,7 +1585,17 @@ try:
                         buscar_usuarios_cadastrados.clear()
                         st.rerun()
 
-                    del_btn = c4.button("🗑️", key=f"del_{i}")
+                    if is_admin_master:
+                        adm_val = c4.checkbox("Acesso ADM", value=is_acesso_adm, key=f"adm_access_{i}")
+                        if adm_val != is_acesso_adm:
+                            if admin_col_idx is None:
+                                admin_col_idx = ensure_admin_col(sheet_u_escrita)
+                            gs_call(sheet_u_escrita.update_cell, i + 2, admin_col_idx, "SIM" if adm_val else "NAO")
+                            buscar_usuarios_admin.clear()
+                            buscar_usuarios_cadastrados.clear()
+                            st.rerun()
+
+                    del_btn = c5.button("🗑️", key=f"del_{i}")
                     if del_btn:
                         gs_call(sheet_u_escrita.delete_rows, i + 2)
                         buscar_usuarios_admin.clear()
