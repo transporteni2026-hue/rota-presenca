@@ -1429,7 +1429,7 @@ try:
                     senha_digitada = str(ad_s or "")
 
                     # ADM mestre: mantém o acesso antigo, com todas as permissões.
-                    if usuario_digitado == "@" and senha_digitada == "@":
+                    if usuario_digitado == "123" and senha_digitada == "123":
                         st.session_state.is_admin = True
                         st.session_state._admin_master = True
                         st.session_state._adm_first_load = True
