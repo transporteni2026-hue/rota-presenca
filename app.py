@@ -1421,9 +1421,9 @@ try:
             * A quantidade de vagas consideradas como "normais" é definida pelo Administrador no painel ADM, no campo **Capacidade do ônibus**. Quem ultrapassar essa capacidade aparecerá como **Exc-xx**.
 
             **3. Observação(2):**
-            * **ATUALIZAÇÃO DE DADOS(1):** Na aba **Adm**, os **Majores podem entrar com seu login e senha para ativar o Cadastro de novos Usuários**, bem como **atribuir Prioridade** a quem obter esse direito.
-            * **ATUALIZAÇÃO DE DADOS(2):** Na aba **Recuperar**, gerar senha temporária. Copie ele e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**, ressaltando que ela **não poderá iniciar com zero seguido apenas por números**.  Após isso, basta **Salvar** e o cadastro estará atualizado.
-            * **PRIORIDADE NO EMBARQUE:** A quem for atribuído a prioridade, terá embarque garantido no ônibus, desde que assinale no App a sua presença; e o nome na lista aparecerá formatada em Azul..
+            * **Ativação de Cadastro e Prioridade:** Na aba **Adm**, os **Majores podem entrar com seu login e senha para ativar o Cadastro de novos Usuários**, bem como **atribuir Prioridade** a quem obter esse direito.
+            * **Atualização de Dados:** Na aba **Recuperar**, gerar senha temporária. Copie ele e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**, ressaltando que ela **não poderá iniciar com zero seguido apenas por números**.  Após isso, basta **Salvar** e o cadastro estará atualizado.
+            * **Prioridade no Embarque:** A quem for atribuído a prioridade, terá embarque garantido no ônibus, desde que assinale no App a sua presença; e o nome na lista aparecerá formatada em Azul..
             """)
 
         with t4:
