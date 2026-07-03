@@ -645,42 +645,63 @@ def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS, pri
     if "QG_RMCF_OUTROS" not in df.columns:
         df["QG_RMCF_OUTROS"] = ""
 
-    # Prioridades
-    p_orig = {"QG": 1, "RMCF": 2, "OUTROS": 3}
-
-    # Ordem solicitada (grupo "normal")
+    # Ordem hierárquica dos militares.
     p_grad_normal = {
         "TCEL": 1, "MAJ": 2, "CAP": 3, "1º TEN": 4, "2º TEN": 5, "SUBTEN": 6,
         "1º SGT": 7, "2º SGT": 8, "3º SGT": 9, "CB": 10, "SD": 11
     }
 
-    # Grupo FC: primeiro FC COM (grupo 1), depois FC TER (grupo 2)
-    def grupo_fc(grad):
-        g = str(grad or "").strip().upper()
-        if g == "FC COM":
-            return 1
-        if g == "FC TER":
+    def normalizar_grad(grad):
+        return str(grad or "").strip().upper()
+
+    def normalizar_origem(origem):
+        return str(origem or "").strip().upper()
+
+    p_orig = {"QG": 1, "RMCF": 2, "OUTROS": 3}
+
+    def bloco_embarque(row):
+        """
+        Prioridade de embarque ajustada:
+        1) Militares do QG, por antiguidade;
+        2) FC COM do QG, por ordem de chegada;
+        3) Militares do RMCF, por antiguidade;
+        4) Militares de OUTROS, por antiguidade;
+        5) FC COM de RMCF/OUTROS, mantendo a ordem antiga por origem e chegada;
+        6) FC TER, mantendo a ordem antiga por origem e chegada;
+        7) Demais casos não previstos.
+        """
+        grad = normalizar_grad(row.get("GRADUAÇÃO", ""))
+        origem = normalizar_origem(row.get("QG_RMCF_OUTROS", ""))
+
+        if grad == "FC COM" and origem == "QG":
             return 2
-        return 0
+        if grad == "FC COM":
+            return 5
+        if grad == "FC TER":
+            return 6
+        if origem == "QG":
+            return 1
+        if origem == "RMCF":
+            return 3
+        if origem == "OUTROS":
+            return 4
+        return 7
 
-    df["grupo_fc"] = df["GRADUAÇÃO"].apply(grupo_fc)
-
-    # Origem sempre: QG -> RMCF -> OUTROS (dentro de cada grupo)
-    df["p_o"] = df["QG_RMCF_OUTROS"].map(p_orig).fillna(99)
-
-    # Para o grupo normal, aplica ordem de graduação; para FC, deixa 0 (desempate por dt)
     def p_grad(row):
-        if int(row.get("grupo_fc", 0)) == 0:
-            return p_grad_normal.get(str(row.get("GRADUAÇÃO", "")).strip().upper(), 999)
-        return 0
+        grad = normalizar_grad(row.get("GRADUAÇÃO", ""))
+        if grad in {"FC COM", "FC TER"}:
+            return 0
+        return p_grad_normal.get(grad, 999)
 
+    df["p_bloco"] = df.apply(bloco_embarque, axis=1)
+    df["p_o"] = df["QG_RMCF_OUTROS"].apply(lambda x: p_orig.get(normalizar_origem(x), 99))
     df["p_g"] = df.apply(p_grad, axis=1)
 
-    # Desempate por quem entrou primeiro
+    # Desempate por quem entrou primeiro. Para FC COM e FC TER, essa é a ordem principal dentro do bloco.
     df["dt"] = pd.to_datetime(df["DATA_HORA"], dayfirst=True, errors="coerce")
 
-    # Ordenação final conforme regra original
-    df = df.sort_values(by=["grupo_fc", "p_o", "p_g", "dt"]).reset_index(drop=True)
+    # Ordenação final: QG militares -> FC COM/QG -> RMCF militares -> OUTROS militares -> FC COM demais -> FC TER.
+    df = df.sort_values(by=["p_bloco", "p_o", "p_g", "dt"]).reset_index(drop=True)
     df["_PRIORIDADE_LISTA"] = df["EMAIL"].astype(str).str.strip().str.lower().isin(prioridade_emails)
 
     # ==========================================================
@@ -728,7 +749,7 @@ def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS, pri
     df.insert(0, "Nº", [str(i + 1) if i < capacidade_onibus else f"Exc-{i - capacidade_onibus + 1:02d}" for i in range(len(df))])
 
     # Remove primeiro as colunas auxiliares para evitar erro de dtype ao inserir HTML
-    df_final = df.drop(columns=["grupo_fc", "p_o", "p_g", "dt", PRIORIDADE_HEADER], errors="ignore").copy()
+    df_final = df.drop(columns=["p_bloco", "p_o", "p_g", "dt", PRIORIDADE_HEADER], errors="ignore").copy()
     df_v = df_final.copy()
 
     for i, r in df_v.iterrows():
@@ -864,9 +885,12 @@ def ordenar_usuarios_para_relatorio(records_u):
     """
     Monta e ordena a relação de usuários cadastrados usando a mesma base
     de prioridade da lista de passageiros:
-    - Origem: QG -> RMCF -> OUTROS;
-    - Graduação: TCEL -> MAJ -> CAP -> ... -> SD;
-    - FC COM e FC TER seguem a mesma chave de grupo usada na lista atual;
+    - Militares do QG por antiguidade;
+    - FC COM do QG por ordem de cadastro/chegada;
+    - Militares do RMCF por antiguidade;
+    - Militares de OUTROS por antiguidade;
+    - FC COM de RMCF/OUTROS pela ordem antiga;
+    - FUNC TER por ordem de cadastro/chegada;
     - Empate: ordem de cadastro na planilha.
     """
     linhas = []
@@ -895,32 +919,49 @@ def ordenar_usuarios_para_relatorio(records_u):
     if df.empty:
         return df
 
-    p_orig = {"QG": 1, "RMCF": 2, "OUTROS": 3}
     p_grad_normal = {
         "TCEL": 1, "MAJ": 2, "CAP": 3, "1º TEN": 4, "2º TEN": 5, "SUBTEN": 6,
         "1º SGT": 7, "2º SGT": 8, "3º SGT": 9, "CB": 10, "SD": 11
     }
 
-    def grupo_fc(grad):
-        g = str(grad or "").strip().upper()
-        if g == "FC COM":
-            return 1
-        if g == "FC TER":
-            return 2
-        return 0
+    def normalizar_grad(grad):
+        return str(grad or "").strip().upper()
 
-    df["grupo_fc"] = df["GRADUAÇÃO"].apply(grupo_fc)
-    df["p_o"] = df["ORIGEM"].map(p_orig).fillna(99)
+    def normalizar_origem(origem):
+        return str(origem or "").strip().upper()
+
+    p_orig = {"QG": 1, "RMCF": 2, "OUTROS": 3}
+
+    def bloco_embarque(row):
+        grad = normalizar_grad(row.get("GRADUAÇÃO", ""))
+        origem = normalizar_origem(row.get("ORIGEM", ""))
+
+        if grad == "FC COM" and origem == "QG":
+            return 2
+        if grad == "FC COM":
+            return 5
+        if grad == "FC TER":
+            return 6
+        if origem == "QG":
+            return 1
+        if origem == "RMCF":
+            return 3
+        if origem == "OUTROS":
+            return 4
+        return 7
 
     def p_grad(row):
-        if int(row.get("grupo_fc", 0)) == 0:
-            return p_grad_normal.get(str(row.get("GRADUAÇÃO", "")).strip().upper(), 999)
-        return 0
+        grad = normalizar_grad(row.get("GRADUAÇÃO", ""))
+        if grad in {"FC COM", "FC TER"}:
+            return 0
+        return p_grad_normal.get(grad, 999)
 
+    df["p_bloco"] = df.apply(bloco_embarque, axis=1)
+    df["p_o"] = df["ORIGEM"].apply(lambda x: p_orig.get(normalizar_origem(x), 99))
     df["p_g"] = df.apply(p_grad, axis=1)
-    df = df.sort_values(by=["grupo_fc", "p_o", "p_g", "_ORDEM_CADASTRO"]).reset_index(drop=True)
+    df = df.sort_values(by=["p_bloco", "p_o", "p_g", "_ORDEM_CADASTRO"]).reset_index(drop=True)
     df.insert(0, "Nº", [str(i + 1) for i in range(len(df))])
-    return df.drop(columns=["grupo_fc", "p_o", "p_g"], errors="ignore")
+    return df.drop(columns=["p_bloco", "p_o", "p_g"], errors="ignore")
 
 
 def gerar_pdf_usuarios_admin(records_u) -> bytes:
@@ -928,7 +969,7 @@ def gerar_pdf_usuarios_admin(records_u) -> bytes:
     agora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
     pdf = PDFRelatorio(
         titulo="ROTA NOVA IGUAÇU - USUÁRIOS CADASTRADOS",
-        sub=f"Emitido em: {agora} | Ordenado pela mesma lógica da lista de passageiros"
+        sub=f"Emitido em: {agora} | Ordem: QG -> FC COM/QG -> RMCF -> OUTROS -> FC COM demais -> FC TER"
     )
     pdf.add_page()
 
