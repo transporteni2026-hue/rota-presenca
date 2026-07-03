@@ -1415,11 +1415,15 @@ try:
             * **Tarde:** Inscrições abertas até às 17:00h. Reabre às 19:00h.
             * **Finais de Semana:** Abrem domingo às 19:00h.
 
-            **2. Observação:**
+            **2. Observação(1):**
             * Nos períodos em que a lista ficar suspensa para conferência (05:00h às 07:00h / 17:00h às 19:00h), os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
             * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Antes de ser zerada, a lista anterior será arquivada automaticamente na aba **Histórico**, onde poderá ser consultada por data e baixada em PDF.
             * A quantidade de vagas consideradas como "normais" é definida pelo Administrador no painel ADM, no campo **Capacidade do ônibus**. Quem ultrapassar essa capacidade aparecerá como **Exc-xx**.
-            * **ATUALIZAÇÃO DOS DADOS:** Na aba **Recuperar**, gerar senha temporária. Copie ele e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**, ressaltando que ela **não poderá iniciar com zero seguido apenas por números**.  Após isso, basta **Salvar** e o cadastro estará atualizado.
+
+            **3. Observação(2):**
+            * **ATUALIZAÇÃO DE DADOS(1):** Na aba **Adm**, os **Majores podem entrar com seu login e senha para ativar o Cadastro de novos Usuários**, bem como **atribuir Prioridade** a quem obter esse direito.
+            * **ATUALIZAÇÃO DE DADOS(2):** Na aba **Recuperar**, gerar senha temporária. Copie ele e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**, ressaltando que ela **não poderá iniciar com zero seguido apenas por números**.  Após isso, basta **Salvar** e o cadastro estará atualizado.
+            * **PRIORIDADE NO EMBARQUE:** A quem for atribuído a prioridade, terá embarque garantido no ônibus, desde que assinale no App a sua presença; e o nome na lista aparecerá formatada em Azul..
             """)
 
         with t4:
