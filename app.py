@@ -1423,7 +1423,7 @@ try:
             **3. Observação (2):**
             * **Ativação de Cadastro e Prioridade:** Na aba **Adm**, os Majores podem entrar com seu login e senha para ativar o Cadastro de novos Usuários, bem como Atribuir Prioridade a quem obter esse direito.
             * **Atualização de Dados:** Na aba **Recuperar**, gerar senha temporária. Copie ela e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**, ressaltando que ela **não poderá iniciar com zero seguido apenas por números**.  Após isso, basta **Salvar** e o cadastro estará atualizado.
-            * **Prioridade no Embarque:** A quem for atribuída a prioridade, terá embarque garantido no ônibus, desde que assinale no App a sua presença; e o nome na lista aparecerá formatada em Azul..
+            * **Prioridade no Embarque:** A quem for atribuída a prioridade, terá embarque garantido no ônibus, desde que assinale no App a sua presença em tempo hábil; e o nome na lista aparecerá formatada em Azul..
             """)
 
         with t4:
