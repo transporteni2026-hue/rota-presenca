@@ -596,16 +596,49 @@ def verificar_status_e_limpar(sheet_p, dados_p):
 # CICLO (exibição abaixo do título)
 # ==========================================================
 def obter_ciclo_atual():
+    """
+    Exibe o ciclo operacional ao qual a lista ainda se refere.
+
+    Importante:
+    - "lista fechada" não significa, necessariamente, "ciclo encerrado";
+    - na sexta-feira, entre 17:00 e 19:00, a lista fica fechada para novas inscrições,
+      mas ainda se refere ao embarque de 18:30 da própria sexta;
+    - somente a partir de 19:00 de sexta o cabeçalho passa a apontar para o próximo
+      ciclo disponível, que é segunda-feira às 06:30.
+    """
     agora = datetime.now(FUSO_BR)
     t = agora.time()
-    wd = agora.weekday()
+    wd = agora.weekday()  # seg=0 ... sex=4, sáb=5, dom=6
 
-    em_fechamento_fds = (wd == 4 and t >= time(17, 0)) or (wd == 5) or (wd == 6 and t < time(19, 0))
-    if em_fechamento_fds:
-        # Próximo ciclo: 06:30 da próxima segunda-feira
-        dias_para_seg = (7 - wd) % 7  # sex->3, sáb->2, dom->1
-        alvo_dt = (agora + timedelta(days=dias_para_seg)).date()
+    # SEXTA-FEIRA:
+    # Até antes das 19:00, mesmo com a lista fechada após 17:00, o ciclo exibido
+    # continua sendo o embarque das 18:30 da própria sexta-feira.
+    if wd == 4:
+        if t < time(7, 0):
+            alvo_dt = agora.date()
+            alvo_h = "06:30"
+        elif t < time(19, 0):
+            alvo_dt = agora.date()
+            alvo_h = "18:30"
+        else:
+            # Após 19:00 de sexta, o próximo ciclo é segunda-feira 06:30.
+            alvo_dt = (agora + timedelta(days=3)).date()
+            alvo_h = "06:30"
+
+    # SÁBADO:
+    # Fechado o dia todo; o próximo ciclo disponível é segunda-feira 06:30.
+    elif wd == 5:
+        alvo_dt = (agora + timedelta(days=2)).date()
         alvo_h = "06:30"
+
+    # DOMINGO:
+    # Antes e depois das 19:00, o ciclo que será aberto é segunda-feira 06:30.
+    elif wd == 6:
+        alvo_dt = (agora + timedelta(days=1)).date()
+        alvo_h = "06:30"
+
+    # SEGUNDA A QUINTA:
+    # Mantém a lógica usual dos ciclos diários.
     else:
         if t >= time(19, 0):
             alvo_dt = (agora + timedelta(days=1)).date()
