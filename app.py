@@ -11,6 +11,7 @@ import time as time_module
 import random
 import re
 import threading
+import logging
 
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
@@ -41,6 +42,21 @@ FUSO_BR = pytz.timezone("America/Sao_Paulo")
 # GIF NO FINAL DA PÁGINA (alteração solicitada)
 # ==========================================================
 GIF_URL = "https://www.imagensanimadas.com/data/media/425/onibus-imagem-animada-0024.gif"
+
+# ==========================================================
+# LOGS E LIMITES DE SEGURANÇA
+# ==========================================================
+LOGGER = logging.getLogger("rota_nova_iguacu")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.setLevel(logging.INFO)
+
+HISTORICO_MARGEM_LINHAS = 1000
+TROCA_CICLO_COOLDOWN_ERRO = 20.0
+TROCA_CICLO_TEMPO_MAXIMO = 90.0
+LOCK_MUTACAO_TIMEOUT = 0.25
 
 
 # ==========================================================
@@ -77,11 +93,72 @@ def tel_is_valid_11(s: str) -> bool:
 
 
 # ==========================================================
-# LOCKS COMPARTILHADOS ENTRE AS SESSÕES DO STREAMLIT
+# COORDENAÇÃO ENTRE AS SESSÕES DO STREAMLIT
 # ==========================================================
+class CoordenadorTrocaCiclo:
+    """
+    Evita que dezenas de sessões tentem arquivar o mesmo ciclo ao mesmo tempo.
+
+    O lock interno é usado apenas para alterar o estado em memória e nunca fica
+    preso durante chamadas ao Google Sheets. Assim, quando uma sessão está
+    processando a troca, as demais recebem resposta imediata em vez de ficarem
+    acumuladas e travarem o processo do Streamlit.
+    """
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self.em_andamento = False
+        self.inicio_monotonic = 0.0
+        self.tentar_novamente_apos = 0.0
+        self.ultimo_erro = ""
+
+    def tentar_iniciar(self):
+        agora = time_module.monotonic()
+        with self._guard:
+            # Recupera automaticamente um estado abandonado por exceção severa.
+            if self.em_andamento and (agora - self.inicio_monotonic) > TROCA_CICLO_TEMPO_MAXIMO:
+                LOGGER.warning("Liberando troca de ciclo considerada abandonada.")
+                self.em_andamento = False
+
+            if self.em_andamento:
+                return False, "EM_ANDAMENTO", 0
+
+            if agora < self.tentar_novamente_apos:
+                restante = max(1, int(self.tentar_novamente_apos - agora) + 1)
+                return False, "COOLDOWN", restante
+
+            self.em_andamento = True
+            self.inicio_monotonic = agora
+            return True, "INICIADA", 0
+
+    def finalizar(self, sucesso: bool, erro: str = ""):
+        agora = time_module.monotonic()
+        with self._guard:
+            self.em_andamento = False
+            self.inicio_monotonic = 0.0
+            self.ultimo_erro = str(erro or "")
+            self.tentar_novamente_apos = 0.0 if sucesso else agora + TROCA_CICLO_COOLDOWN_ERRO
+
+    def obter_status(self):
+        agora = time_module.monotonic()
+        with self._guard:
+            if self.em_andamento and (agora - self.inicio_monotonic) <= TROCA_CICLO_TEMPO_MAXIMO:
+                return "EM_ANDAMENTO", 0
+            if agora < self.tentar_novamente_apos:
+                restante = max(1, int(self.tentar_novamente_apos - agora) + 1)
+                return "COOLDOWN", restante
+            return "LIVRE", 0
+
+
 @st.cache_resource
-def lock_operacoes_presenca():
-    # Impede que duas sessões arquivem/limpem/gravem a lista ao mesmo tempo.
+def coordenador_troca_ciclo():
+    return CoordenadorTrocaCiclo()
+
+
+@st.cache_resource
+def lock_mutacoes_presenca():
+    # Serializa somente as mutações efetivas da planilha. Quem não consegue
+    # adquirir rapidamente recebe uma mensagem e não fica preso em fila.
     return threading.RLock()
 
 
@@ -91,12 +168,31 @@ def lock_estrutura_planilhas():
     return threading.RLock()
 
 
+def adquirir_lock_mutacao(timeout=LOCK_MUTACAO_TIMEOUT):
+    lock = lock_mutacoes_presenca()
+    adquirido = lock.acquire(timeout=timeout)
+    return lock, adquirido
+
+
 # ==========================================================
 # WRAPPER COM RETRY / BACKOFF PARA 429 E ERROS TEMPORÁRIOS
 # ==========================================================
-def gs_call(func, *args, **kwargs):
-    max_tries = 5
-    base = 0.5
+def gs_call(
+    func,
+    *args,
+    _max_tries=5,
+    _base=0.5,
+    _max_sleep=4.0,
+    **kwargs
+):
+    """
+    Executa uma chamada ao Google Sheets com backoff para 429/5xx.
+
+    Os parâmetros iniciados por underscore pertencem ao wrapper e não são
+    enviados à função do gspread. Em operações que seguram lock, o chamador
+    pode usar menos tentativas para evitar retenção prolongada.
+    """
+    max_tries = max(1, int(_max_tries))
     last_error = None
 
     for attempt in range(max_tries):
@@ -123,8 +219,8 @@ def gs_call(func, *args, **kwargs):
             if attempt >= max_tries - 1:
                 break
 
-            sleep_s = (base * (2 ** attempt)) + random.uniform(0.0, 0.25)
-            time_module.sleep(min(sleep_s, 4.0))
+            sleep_s = (_base * (2 ** attempt)) + random.uniform(0.0, 0.25)
+            time_module.sleep(min(sleep_s, _max_sleep))
 
     raise RuntimeError(
         "Google Sheets temporariamente indisponível ou com excesso de requisições. "
@@ -213,7 +309,7 @@ def ws_historico():
                 sheet_h = gs_call(
                     doc.add_worksheet,
                     title=WS_HISTORICO,
-                    rows="1000",
+                    rows=str(HISTORICO_MARGEM_LINHAS),
                     cols=str(len(HIST_HEADERS))
                 )
                 gs_call(sheet_h.update, "A1", [HIST_HEADERS])
@@ -236,6 +332,94 @@ HIST_HEADERS = [
     "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL",
     "CAPACIDADE_ONIBUS", PRIORIDADE_HEADER
 ]
+
+
+def obter_ws_historico_fresco():
+    """
+    Obtém um objeto Worksheet novo, com metadados atuais da grade.
+
+    Isso é importante porque a aba pode ter sido redimensionada manualmente
+    enquanto o app estava no ar, e um objeto guardado em cache pode continuar
+    com row_count/col_count antigos até um reboot.
+    """
+    doc = abrir_documento()
+    try:
+        sheet_h = gs_call(doc.worksheet, WS_HISTORICO, _max_tries=3)
+    except WorksheetNotFound:
+        # A criação continua protegida contra duas sessões simultâneas.
+        with lock_estrutura_planilhas():
+            try:
+                sheet_h = gs_call(doc.worksheet, WS_HISTORICO, _max_tries=3)
+            except WorksheetNotFound:
+                sheet_h = gs_call(
+                    doc.add_worksheet,
+                    title=WS_HISTORICO,
+                    rows=str(HISTORICO_MARGEM_LINHAS),
+                    cols=str(len(HIST_HEADERS)),
+                    _max_tries=3
+                )
+
+    headers = [str(h).strip() for h in gs_call(sheet_h.row_values, 1, _max_tries=3)]
+    if headers[:len(HIST_HEADERS)] != HIST_HEADERS:
+        gs_call(sheet_h.update, "A1", [HIST_HEADERS], _max_tries=3)
+
+    return sheet_h
+
+
+def garantir_espaco_historico(sheet_h, linha_inicial: int, qtd_linhas: int):
+    """Expande automaticamente a grade antes da gravação do histórico."""
+    qtd_linhas = max(0, int(qtd_linhas))
+    if qtd_linhas == 0:
+        return
+
+    ultima_linha_necessaria = linha_inicial + qtd_linhas - 1
+    linhas_atuais = int(getattr(sheet_h, "row_count", 0) or 0)
+    colunas_atuais = int(getattr(sheet_h, "col_count", 0) or 0)
+
+    linhas_alvo = linhas_atuais
+    colunas_alvo = max(colunas_atuais, len(HIST_HEADERS))
+
+    if linhas_atuais < ultima_linha_necessaria:
+        # Acrescenta uma margem ampla para que a expansão não precise ocorrer
+        # em toda troca de ciclo.
+        linhas_alvo = max(
+            ultima_linha_necessaria + HISTORICO_MARGEM_LINHAS,
+            linhas_atuais + HISTORICO_MARGEM_LINHAS,
+            HISTORICO_MARGEM_LINHAS
+        )
+
+    if linhas_alvo != linhas_atuais or colunas_alvo != colunas_atuais:
+        LOGGER.info(
+            "Expandindo aba Historico: %s x %s -> %s x %s",
+            linhas_atuais, colunas_atuais, linhas_alvo, colunas_alvo
+        )
+        gs_call(
+            sheet_h.resize,
+            rows=linhas_alvo,
+            cols=colunas_alvo,
+            _max_tries=3,
+            _max_sleep=2.0
+        )
+
+
+def validar_bloco_historico(sheet_h, linha_inicial: int, qtd_linhas: int, ciclo_id: str):
+    """Confirma que todas as linhas foram realmente gravadas antes da limpeza."""
+    linha_final = linha_inicial + qtd_linhas - 1
+    valores = gs_call(
+        sheet_h.get,
+        f"A{linha_inicial}:L{linha_final}",
+        _max_tries=3,
+        _max_sleep=2.0
+    )
+
+    if len(valores) != qtd_linhas:
+        return False
+
+    for linha in valores:
+        if not linha or str(linha[0]).strip() != ciclo_id:
+            return False
+
+    return True
 
 def _br_now():
     return datetime.now(FUSO_BR)
@@ -599,28 +783,20 @@ def arquivar_lista_antes_de_limpar(dados_p):
     """
     Copia a lista atual para a aba Historico antes da limpeza.
 
-    Retorno:
-    - (True, "ARQUIVADA") quando gravou o histórico;
-    - (True, "JA_ARQUIVADA") quando o ciclo já estava salvo;
-    - (True, "VAZIA") quando não havia passageiros;
-    - (False, mensagem) quando houve falha.
-
-    A limpeza só é autorizada quando o retorno for True.
+    A grade é expandida previamente, a escrita ocorre em faixa explícita e a
+    confirmação é feita por assinatura DATA_HORA + EMAIL. Se uma tentativa
+    anterior tiver gravado apenas parte do ciclo, somente as linhas faltantes
+    serão acrescentadas, sem sobrescrever outros históricos.
     """
     if not dados_p or len(dados_p) < 2:
         return True, "VAZIA"
 
     try:
-        sheet_h = ws_historico()
+        sheet_h = obter_ws_historico_fresco()
 
         ciclo_id, data_ciclo, embarque = identificar_ciclo_da_lista(dados_p)
         capacidade_onibus = buscar_capacidade_onibus_dinamica()
         prioridade_emails = obter_emails_prioridade(buscar_usuarios_cadastrados())
-
-        # Consulta somente a coluna de IDs, em vez de carregar todo o histórico.
-        ciclos_existentes = {str(v).strip() for v in gs_call(sheet_h.col_values, 1)[1:] if str(v).strip()}
-        if ciclo_id in ciclos_existentes:
-            return True, "JA_ARQUIVADA"
 
         arquivado_em = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
         linhas = []
@@ -633,24 +809,107 @@ def arquivar_lista_antes_de_limpar(dados_p):
                 data_ciclo,
                 embarque,
                 arquivado_em,
-                r[0],  # DATA_HORA
-                r[1],  # QG_RMCF_OUTROS
-                r[2],  # GRADUAÇÃO
-                r[3],  # NOME
-                r[4],  # LOTAÇÃO
-                r[5],  # EMAIL
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                r[5],
                 str(capacidade_onibus),
                 "SIM" if email_linha in prioridade_emails else "NAO",
             ])
 
-        if linhas:
-            gs_call(sheet_h.append_rows, linhas, value_input_option="USER_ENTERED")
-            buscar_historico_dados.clear()
-            return True, "ARQUIVADA"
+        if not linhas:
+            return True, "VAZIA"
 
-        return True, "VAZIA"
+        def assinatura(linha):
+            linha = list(linha) + [""] * 12
+            return (
+                str(linha[4]).strip(),
+                str(linha[9]).strip().lower(),
+            )
+
+        # Esta leitura completa ocorre apenas na troca de ciclo (normalmente
+        # duas vezes ao dia) e permite detectar/reparar gravação parcial.
+        historico_atual = gs_call(
+            sheet_h.get_all_values,
+            _max_tries=3,
+            _max_sleep=2.0
+        )
+        assinaturas_existentes = {
+            assinatura(row)
+            for row in (historico_atual or [])[1:]
+            if row and str(row[0]).strip() == ciclo_id
+        }
+
+        linhas_faltantes = [
+            linha for linha in linhas
+            if assinatura(linha) not in assinaturas_existentes
+        ]
+
+        if not linhas_faltantes:
+            LOGGER.info("Ciclo %s já estava integralmente arquivado.", ciclo_id)
+            return True, "JA_ARQUIVADA"
+
+        if assinaturas_existentes:
+            LOGGER.warning(
+                "Histórico parcial detectado no ciclo %s: %s de %s linha(s) já existiam.",
+                ciclo_id, len(assinaturas_existentes), len(linhas)
+            )
+
+        linha_inicial = max(2, len(historico_atual or []) + 1)
+        garantir_espaco_historico(sheet_h, linha_inicial, len(linhas_faltantes))
+        linha_final = linha_inicial + len(linhas_faltantes) - 1
+        faixa = f"A{linha_inicial}:L{linha_final}"
+
+        gs_call(
+            sheet_h.update,
+            faixa,
+            linhas_faltantes,
+            value_input_option="USER_ENTERED",
+            _max_tries=4,
+            _max_sleep=2.0
+        )
+
+        if not validar_bloco_historico(
+            sheet_h,
+            linha_inicial,
+            len(linhas_faltantes),
+            ciclo_id
+        ):
+            raise RuntimeError(
+                f"A nova gravação do ciclo {ciclo_id} não foi confirmada integralmente."
+            )
+
+        # Confirma que o conjunto final contém todos os passageiros esperados.
+        historico_confirmacao = gs_call(
+            sheet_h.get_all_values,
+            _max_tries=3,
+            _max_sleep=2.0
+        )
+        assinaturas_confirmadas = {
+            assinatura(row)
+            for row in (historico_confirmacao or [])[1:]
+            if row and str(row[0]).strip() == ciclo_id
+        }
+        assinaturas_esperadas = {assinatura(row) for row in linhas}
+
+        if not assinaturas_esperadas.issubset(assinaturas_confirmadas):
+            faltam = len(assinaturas_esperadas - assinaturas_confirmadas)
+            raise RuntimeError(
+                f"O ciclo {ciclo_id} ainda possui {faltam} registro(s) não confirmados no histórico."
+            )
+
+        buscar_historico_dados.clear()
+        LOGGER.info(
+            "Ciclo %s arquivado com sucesso; %s linha(s) nova(s) gravada(s).",
+            ciclo_id, len(linhas_faltantes)
+        )
+        return True, "ARQUIVADA"
+
     except Exception as exc:
-        return False, str(exc)
+        LOGGER.exception("Falha ao arquivar a lista no Historico.")
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def obter_estado_operacional(agora=None):
@@ -753,46 +1012,127 @@ def lista_precisa_limpeza(dados_p, agora=None):
 
 def sincronizar_troca_de_ciclo(sheet_p, agora=None):
     """
-    Releitura e troca de ciclo protegidas por um lock compartilhado.
-    Somente uma sessão pode arquivar e limpar; as demais, ao entrarem no
-    lock, encontram a planilha já limpa e não repetem a operação.
+    Arquiva e limpa uma lista vencida sem formar fila de sessões.
+
+    A ordem é proposital:
+    1) verificar se já há troca em andamento;
+    2) tentar adquirir rapidamente o lock de mutação;
+    3) marcar a troca como em andamento;
+    4) reler, arquivar, confirmar e limpar.
+
+    As demais sessões não aguardam as tentativas da API: recebem imediatamente
+    EM_ANDAMENTO/OCUPADO e podem atualizar alguns segundos depois.
     """
     agora = agora or datetime.now(FUSO_BR)
+    coord = coordenador_troca_ciclo()
 
-    with lock_operacoes_presenca():
-        dados_frescos = gs_call(sheet_p.get_all_values)
+    status_atual, restante = coord.obter_status()
+    if status_atual == "EM_ANDAMENTO":
+        return False, None, "EM_ANDAMENTO", 0
+    if status_atual == "COOLDOWN":
+        return False, None, "COOLDOWN", restante
+
+    lock, adquirido = adquirir_lock_mutacao()
+    if not adquirido:
+        status_atual, restante = coord.obter_status()
+        if status_atual == "EM_ANDAMENTO":
+            return False, None, "EM_ANDAMENTO", 0
+        return False, None, "OCUPADO", 1
+
+    iniciou = False
+    try:
+        pode_iniciar, status_inicio, restante = coord.tentar_iniciar()
+        if not pode_iniciar:
+            return False, None, status_inicio, restante
+        iniciou = True
+
+        dados_frescos = gs_call(
+            sheet_p.get_all_values,
+            _max_tries=3,
+            _max_sleep=2.0
+        )
         dados_validos = filtrar_linhas_presenca(dados_frescos)
 
         if not lista_precisa_limpeza(dados_validos, agora):
-            return False, dados_validos, None
+            coord.finalizar(True)
+            iniciou = False
+            return False, dados_validos, "NAO_NECESSARIA", 0
 
-        ok, status = arquivar_lista_antes_de_limpar(dados_validos)
+        ok, status_arquivo = arquivar_lista_antes_de_limpar(dados_validos)
         if not ok:
-            return False, dados_validos, status
+            raise RuntimeError(status_arquivo)
 
-        # Uma única chamada; preserva o cabeçalho e não redimensiona a aba.
-        gs_call(sheet_p.batch_clear, ["A2:F"])
+        # Preserva o cabeçalho. A faixa inteira abaixo dele é limpa em uma única
+        # operação, independentemente da quantidade de linhas da aba principal.
+        gs_call(
+            sheet_p.batch_clear,
+            ["A2:F"],
+            _max_tries=3,
+            _max_sleep=2.0
+        )
+
+        # Confirma que não restaram passageiros antes de liberar o novo ciclo.
+        restante_planilha = gs_call(
+            sheet_p.get,
+            "A2:F",
+            _max_tries=3,
+            _max_sleep=2.0
+        )
+        ainda_tem_dados = any(
+            any(str(celula).strip() for celula in linha)
+            for linha in (restante_planilha or [])
+        )
+        if ainda_tem_dados:
+            raise RuntimeError("A limpeza da lista principal não foi confirmada.")
 
         header = dados_frescos[0] if dados_frescos else [
             "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"
         ]
-        return True, [header], None
+        coord.finalizar(True)
+        iniciou = False
+        LOGGER.info("Troca de ciclo concluída com segurança (%s).", status_arquivo)
+        return True, [header], "LIMPA", 0
+
+    except Exception as exc:
+        LOGGER.exception("Falha durante a troca de ciclo.")
+        if iniciou:
+            coord.finalizar(False, f"{type(exc).__name__}: {exc}")
+            iniciou = False
+        return False, None, "FALHA", int(TROCA_CICLO_COOLDOWN_ERRO)
+    finally:
+        if iniciou:
+            coord.finalizar(False, "Troca interrompida antes da finalização.")
+        lock.release()
 
 
 def verificar_status_e_limpar(sheet_p, dados_p):
     agora = datetime.now(FUSO_BR)
     estado = obter_estado_operacional(agora)
 
-    # A leitura cacheada é usada apenas como gatilho. A decisão final sempre
-    # é tomada após nova leitura dentro do lock.
+    # A leitura cacheada funciona somente como gatilho. A decisão final e a
+    # gravação usam uma nova leitura dentro da região de mutação protegida.
     if lista_precisa_limpeza(dados_p, agora):
-        limpou, _dados_frescos, erro = sincronizar_troca_de_ciclo(sheet_p, agora)
+        limpou, _dados_frescos, status, espera = sincronizar_troca_de_ciclo(sheet_p, agora)
 
-        if erro:
+        if status in {"EM_ANDAMENTO", "OCUPADO"}:
+            st.warning(
+                "A troca de ciclo está sendo concluída por outro acesso. "
+                "Aguarde alguns segundos e toque em ATUALIZAR."
+            )
+            return False, estado["janela_conferencia"]
+
+        if status == "COOLDOWN":
+            st.error(
+                "A última tentativa de troca de ciclo encontrou uma falha temporária. "
+                f"Uma nova tentativa será liberada em aproximadamente {espera} segundo(s)."
+            )
+            return False, estado["janela_conferencia"]
+
+        if status == "FALHA":
             st.error(
                 "Não foi possível concluir com segurança a troca de ciclo. "
-                "A lista ficará temporariamente bloqueada para evitar misturar ou apagar inscrições. "
-                f"Detalhe: {erro}"
+                "A lista permanecerá bloqueada para não misturar nem apagar inscrições. "
+                "Aguarde cerca de 20 segundos e toque em ATUALIZAR."
             )
             return False, estado["janela_conferencia"]
 
@@ -804,49 +1144,96 @@ def verificar_status_e_limpar(sheet_p, dados_p):
 
 
 def registrar_presenca_se_ausente(sheet_p, usuario):
-    """Grava uma presença de forma serializada e impede duplicidade."""
+    """Grava uma presença sem duplicidade e sem esperar em fila longa."""
     email = str(usuario.get("Email", "")).strip().lower()
 
-    with lock_operacoes_presenca():
-        # Confere novamente o horário dentro do lock para impedir gravação
-        # exatamente após o fechamento da lista.
-        if not obter_estado_operacional()["aberto"]:
-            return False
+    lock, adquirido = adquirir_lock_mutacao()
+    if not adquirido:
+        status, _ = coordenador_troca_ciclo().obter_status()
+        if status == "EM_ANDAMENTO":
+            return False, "TROCA_EM_ANDAMENTO"
+        return False, "SISTEMA_OCUPADO"
 
-        # Garante que uma sessão aberta antes da virada não grave no ciclo antigo.
-        _limpou, dados_frescos, erro = sincronizar_troca_de_ciclo(sheet_p)
-        if erro:
-            raise RuntimeError(
-                "Não foi possível preparar o novo ciclo com segurança. " + str(erro)
+    try:
+        # A validação de horário e a eventual troca de ciclo são executadas
+        # enquanto nenhuma outra sessão pode gravar ou apagar linhas. Como o
+        # lock é RLock, sincronizar_troca_de_ciclo pode reutilizá-lo nesta thread.
+        if not obter_estado_operacional()["aberto"]:
+            return False, "LISTA_FECHADA"
+
+        limpou, dados_frescos, status, _espera = sincronizar_troca_de_ciclo(sheet_p)
+        if status in {"EM_ANDAMENTO", "OCUPADO", "COOLDOWN", "FALHA"}:
+            return False, "TROCA_PENDENTE"
+
+        if dados_frescos is None:
+            dados_frescos = gs_call(
+                sheet_p.get_all_values,
+                _max_tries=2,
+                _max_sleep=1.0
             )
 
         for row in (dados_frescos or [])[1:]:
             if len(row) >= 6 and str(row[5]).strip().lower() == email:
-                return False
+                return False, "JA_REGISTRADA"
 
         agora_str = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
-        gs_call(sheet_p.append_row, [
-            agora_str,
-            usuario.get("QG_RMCF_OUTROS") or "QG",
-            usuario.get("Graduação"),
-            usuario.get("Nome"),
-            usuario.get("Lotação"),
-            usuario.get("Email")
-        ])
-        return True
+        gs_call(
+            sheet_p.append_row,
+            [
+                agora_str,
+                usuario.get("QG_RMCF_OUTROS") or "QG",
+                usuario.get("Graduação"),
+                usuario.get("Nome"),
+                usuario.get("Lotação"),
+                usuario.get("Email")
+            ],
+            value_input_option="USER_ENTERED",
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        return True, "REGISTRADA"
+
+    except Exception:
+        LOGGER.exception("Falha ao registrar presença.")
+        return False, "ERRO_GRAVACAO"
+    finally:
+        lock.release()
 
 
 def excluir_presenca_por_email(sheet_p, email):
-    """Exclui a presença com nova leitura dentro do mesmo lock das gravações."""
+    """Exclui somente a própria presença sem formar fila de sessões."""
     email = str(email or "").strip().lower()
 
-    with lock_operacoes_presenca():
-        dados_frescos = gs_call(sheet_p.get_all_values)
+    lock, adquirido = adquirir_lock_mutacao()
+    if not adquirido:
+        return False, "SISTEMA_OCUPADO"
+
+    try:
+        status_coord, _ = coordenador_troca_ciclo().obter_status()
+        if status_coord == "EM_ANDAMENTO":
+            return False, "TROCA_EM_ANDAMENTO"
+
+        dados_frescos = gs_call(
+            sheet_p.get_all_values,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
         for row_number, row in enumerate(dados_frescos[1:], start=2):
             if len(row) >= 6 and str(row[5]).strip().lower() == email:
-                gs_call(sheet_p.delete_rows, row_number)
-                return True
-    return False
+                gs_call(
+                    sheet_p.delete_rows,
+                    row_number,
+                    _max_tries=2,
+                    _max_sleep=1.0
+                )
+                return True, "EXCLUIDA"
+        return False, "NAO_ENCONTRADA"
+
+    except Exception:
+        LOGGER.exception("Falha ao excluir presença.")
+        return False, "ERRO_EXCLUSAO"
+    finally:
+        lock.release()
 
 
 # ==========================================================
@@ -1459,6 +1846,8 @@ if "_tel_cad_fmt" not in st.session_state:
 # ==========================================================
 if "_confirmar_exclusao_presenca" not in st.session_state:
     st.session_state._confirmar_exclusao_presenca = False
+if "_flash_operacao" not in st.session_state:
+    st.session_state._flash_operacao = None
 
 try:
     # Verificação estrutural executada apenas uma vez por inicialização do app.
@@ -2037,6 +2426,17 @@ try:
         st.sidebar.markdown("### 👤 Usuário Conectado 🙍‍♂️")
         st.sidebar.info(f"**{u.get('Graduação')} {u.get('Nome')}**")
 
+        flash_operacao = st.session_state.get("_flash_operacao")
+        if flash_operacao:
+            tipo_flash, texto_flash = flash_operacao
+            st.session_state._flash_operacao = None
+            if tipo_flash == "success":
+                st.success(texto_flash)
+            elif tipo_flash == "warning":
+                st.warning(texto_flash)
+            else:
+                st.error(texto_flash)
+
         sair_user = st.sidebar.button("⬅️ Sair", use_container_width=True)
         if sair_user:
             for key in list(st.session_state.keys()):
@@ -2105,18 +2505,43 @@ try:
 
                 if sim_btn:
                     email_logado = str(u.get("Email")).strip().lower()
-                    excluir_presenca_por_email(sheet_p_escrita, email_logado)
+                    excluiu, status_exclusao = excluir_presenca_por_email(sheet_p_escrita, email_logado)
 
-                    st.session_state._confirmar_exclusao_presenca = False
-                    st.session_state._force_refresh_presenca = True
-                    st.rerun()
+                    if excluiu:
+                        st.session_state._confirmar_exclusao_presenca = False
+                        st.session_state._force_refresh_presenca = True
+                        st.session_state._flash_operacao = ("success", "✅ Presença excluída com sucesso.")
+                        st.rerun()
+                    elif status_exclusao in {"SISTEMA_OCUPADO", "TROCA_EM_ANDAMENTO"}:
+                        st.warning("O sistema está concluindo outra operação. Aguarde alguns segundos e tente novamente.")
+                    elif status_exclusao == "NAO_ENCONTRADA":
+                        st.session_state._confirmar_exclusao_presenca = False
+                        st.session_state._force_refresh_presenca = True
+                        st.session_state._flash_operacao = ("warning", "Sua presença já não estava mais na lista.")
+                        st.rerun()
+                    else:
+                        st.error("Não foi possível excluir sua presença agora. Atualize e tente novamente.")
 
         elif aberto:
             salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True)
             if salvar_btn:
-                registrar_presenca_se_ausente(sheet_p_escrita, u)
-                st.session_state._force_refresh_presenca = True
-                st.rerun()
+                gravou, status_gravacao = registrar_presenca_se_ausente(sheet_p_escrita, u)
+                if gravou:
+                    st.session_state._force_refresh_presenca = True
+                    st.rerun()
+                elif status_gravacao == "JA_REGISTRADA":
+                    st.session_state._force_refresh_presenca = True
+                    st.session_state._flash_operacao = ("success", "✅ Sua presença já está registrada.")
+                    st.rerun()
+                elif status_gravacao == "LISTA_FECHADA":
+                    st.warning("A lista foi fechada antes da conclusão da operação. Atualize a página.")
+                elif status_gravacao in {"TROCA_EM_ANDAMENTO", "TROCA_PENDENTE", "SISTEMA_OCUPADO"}:
+                    st.warning(
+                        "O sistema está concluindo a troca de ciclo ou outra inscrição. "
+                        "Aguarde alguns segundos e toque novamente em CONFIRMAR."
+                    )
+                else:
+                    st.error("Não foi possível registrar sua presença agora. Atualize e tente novamente.")
         else:
             st.info("⌛ Lista fechada para novas inscrições.")
 
