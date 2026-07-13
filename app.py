@@ -2489,7 +2489,7 @@ try:
         st.sidebar.markdown("---")
         menu_usuario = st.sidebar.radio("Menu", ["Lista Atual", "Histórico"], index=0)
         st.sidebar.markdown("---")
-        st.sidebar.caption("Desenvolvido e atualizado em 2026 por: MAJ ANDRÉ AGUIAR - 3ª DPJM®️")
+        st.sidebar.caption("Desenvolvido e atualizado em 2026 por:   MAJ ANDRÉ AGUIAR - 3ª DPJM®️")
 
         sheet_p_escrita = ws_presenca()
 
@@ -2738,7 +2738,7 @@ try:
                     unsafe_allow_html=True
                 )
 
-    st.markdown('<div class="footer">Desenvolvido e atualizado em 2026 por: <b>MAJ ANDRÉ AGUIAR - 3ª DPJM®️</b></div>', unsafe_allow_html=True)
+    st.markdown('<div class="footer">Desenvolvido e atualizado em 2026 por:   <b>MAJ ANDRÉ AGUIAR - 3ª DPJM®️</b></div>', unsafe_allow_html=True)
 
     # ==========================================================
     # GIF NO FINAL DA PÁGINA
