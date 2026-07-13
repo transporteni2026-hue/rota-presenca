@@ -1,6 +1,6 @@
 import streamlit as st
 import gspread
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 import pandas as pd
 from datetime import datetime, time, timedelta
@@ -10,6 +10,7 @@ import urllib.parse
 import time as time_module
 import random
 import re
+import threading
 
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
@@ -76,24 +77,59 @@ def tel_is_valid_11(s: str) -> bool:
 
 
 # ==========================================================
-# WRAPPER COM RETRY / BACKOFF PARA 429
+# LOCKS COMPARTILHADOS ENTRE AS SESSÕES DO STREAMLIT
+# ==========================================================
+@st.cache_resource
+def lock_operacoes_presenca():
+    # Impede que duas sessões arquivem/limpem/gravem a lista ao mesmo tempo.
+    return threading.RLock()
+
+
+@st.cache_resource
+def lock_estrutura_planilhas():
+    # Evita criação concorrente de abas/colunas durante a inicialização.
+    return threading.RLock()
+
+
+# ==========================================================
+# WRAPPER COM RETRY / BACKOFF PARA 429 E ERROS TEMPORÁRIOS
 # ==========================================================
 def gs_call(func, *args, **kwargs):
-    max_tries = 6
-    base = 0.6
+    max_tries = 5
+    base = 0.5
+    last_error = None
+
     for attempt in range(max_tries):
         try:
             return func(*args, **kwargs)
         except APIError as e:
+            last_error = e
             msg = str(e)
-            is_429 = ("429" in msg) or ("Quota exceeded" in msg) or ("RESOURCE_EXHAUSTED" in msg)
-            is_5xx = any(code in msg for code in ["500", "502", "503", "504"])
-            if is_429 or is_5xx:
-                sleep_s = (base * (2 ** attempt)) + random.uniform(0.0, 0.35)
-                time_module.sleep(min(sleep_s, 6.0))
-                continue
-            raise
-    raise APIError("Google Sheets: muitas requisições (429). Tente novamente em instantes.")
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            is_429 = (
+                status_code == 429
+                or "429" in msg
+                or "Quota exceeded" in msg
+                or "RESOURCE_EXHAUSTED" in msg
+            )
+            is_5xx = (
+                status_code in {500, 502, 503, 504}
+                or any(code in msg for code in ["500", "502", "503", "504"])
+            )
+
+            if not (is_429 or is_5xx):
+                raise
+
+            if attempt >= max_tries - 1:
+                break
+
+            sleep_s = (base * (2 ** attempt)) + random.uniform(0.0, 0.25)
+            time_module.sleep(min(sleep_s, 4.0))
+
+    raise RuntimeError(
+        "Google Sheets temporariamente indisponível ou com excesso de requisições. "
+        "Aguarde alguns segundos e tente novamente."
+    ) from last_error
 
 
 # ==========================================================
@@ -129,12 +165,34 @@ def ws_presenca():
 @st.cache_resource
 def ws_config():
     doc = abrir_documento()
-    try:
-        return gs_call(doc.worksheet, WS_CONFIG)
-    except Exception:
-        sheet_c = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
-        gs_call(sheet_c.update, "A1:B2", [["LIMITE", "CAPACIDADE_ONIBUS"], ["100", str(CAPACIDADE_PADRAO_ONIBUS)]])
+
+    with lock_estrutura_planilhas():
+        try:
+            sheet_c = gs_call(doc.worksheet, WS_CONFIG)
+        except WorksheetNotFound:
+            # Confere novamente dentro do lock antes de criar.
+            try:
+                sheet_c = gs_call(doc.worksheet, WS_CONFIG)
+            except WorksheetNotFound:
+                sheet_c = gs_call(doc.add_worksheet, title=WS_CONFIG, rows="10", cols="5")
+                gs_call(
+                    sheet_c.update,
+                    "A1:B2",
+                    [["LIMITE", "CAPACIDADE_ONIBUS"], ["100", str(CAPACIDADE_PADRAO_ONIBUS)]]
+                )
+
+        # Garante a capacidade apenas uma vez por inicialização do app.
+        cabecalho = gs_call(sheet_c.row_values, 1)
+        b1 = str(cabecalho[1]).strip() if len(cabecalho) > 1 else ""
+        if b1 != "CAPACIDADE_ONIBUS":
+            gs_call(
+                sheet_c.update,
+                "B1:B2",
+                [["CAPACIDADE_ONIBUS"], [str(CAPACIDADE_PADRAO_ONIBUS)]]
+            )
+
         return sheet_c
+
 
 @st.cache_resource
 def ws_historico():
@@ -143,12 +201,28 @@ def ws_historico():
     Se a aba não existir, ela será criada automaticamente.
     """
     doc = abrir_documento()
-    try:
-        sheet_h = gs_call(doc.worksheet, WS_HISTORICO)
-    except Exception:
-        sheet_h = gs_call(doc.add_worksheet, title=WS_HISTORICO, rows="1000", cols=str(len(HIST_HEADERS)))
-        gs_call(sheet_h.update, "A1", [HIST_HEADERS])
-    return sheet_h
+
+    with lock_estrutura_planilhas():
+        try:
+            sheet_h = gs_call(doc.worksheet, WS_HISTORICO)
+        except WorksheetNotFound:
+            # Confere novamente dentro do lock antes de criar.
+            try:
+                sheet_h = gs_call(doc.worksheet, WS_HISTORICO)
+            except WorksheetNotFound:
+                sheet_h = gs_call(
+                    doc.add_worksheet,
+                    title=WS_HISTORICO,
+                    rows="1000",
+                    cols=str(len(HIST_HEADERS))
+                )
+                gs_call(sheet_h.update, "A1", [HIST_HEADERS])
+
+        headers = [str(h).strip() for h in gs_call(sheet_h.row_values, 1)]
+        if headers[:len(HIST_HEADERS)] != HIST_HEADERS:
+            gs_call(sheet_h.update, "A1", [HIST_HEADERS])
+
+        return sheet_h
 
 
 # ==========================================================
@@ -272,6 +346,45 @@ def admin_acesso_ativo(valor) -> bool:
     return str(valor or "").strip().upper() in {"SIM", "S", "TRUE", "VERDADEIRO", "1", "YES", "Y"}
 
 
+@st.cache_resource
+def inicializar_estrutura_usuarios():
+    """
+    Garante todas as colunas auxiliares da aba Usuarios uma única vez por
+    inicialização do app. Antes, três leituras eram feitas em toda execução
+    de toda sessão, aumentando muito o consumo da API nos horários de pico.
+    """
+    with lock_estrutura_planilhas():
+        sheet_u = ws_usuarios()
+        headers = [str(h).strip() for h in gs_call(sheet_u.row_values, 1)]
+
+        obrigatorias = TEMP_HEADERS + [PRIORIDADE_HEADER, ADMIN_HEADER]
+        missing = [h for h in obrigatorias if h not in headers]
+        if not missing:
+            return True
+
+        new_headers = headers + missing
+        gs_call(sheet_u.update, "A1", [new_headers])
+
+        rows = gs_call(sheet_u.get_all_values)
+        n_rows = len(rows)
+        if n_rows >= 2:
+            defaults = {
+                "TEMP_SENHA": "",
+                "TEMP_EXPIRA": "",
+                "TEMP_USADA": "SIM",
+                PRIORIDADE_HEADER: "NAO",
+                ADMIN_HEADER: "NAO",
+            }
+
+            for header in missing:
+                col_idx = new_headers.index(header) + 1
+                col_letter = gspread.utils.rowcol_to_a1(1, col_idx).rstrip("1")
+                rng_col = f"{col_letter}2:{col_letter}{n_rows}"
+                gs_call(sheet_u.update, rng_col, [[defaults[header]]] * (n_rows - 1))
+
+        return True
+
+
 def obter_emails_prioridade(records_u) -> set:
     """Retorna os e-mails dos usuários marcados com prioridade de embarque."""
     emails = set()
@@ -325,20 +438,17 @@ def find_user_row_by_email_tel(sheet_u, email: str, tel_digits: str):
 @st.cache_data(ttl=30)
 def buscar_usuarios_cadastrados():
     """Uso geral (Login/Cadastro/Recuperar)."""
-    try:
-        sheet_u = ws_usuarios()
-        return gs_call(sheet_u.get_all_records)
-    except Exception:
-        return []
+    # Não transforma falha de leitura em lista vazia, pois isso poderia
+    # permitir cadastro duplicado ou negar login de usuário existente.
+    sheet_u = ws_usuarios()
+    return gs_call(sheet_u.get_all_records)
+
 
 @st.cache_data(ttl=3)
 def buscar_usuarios_admin():
     """Uso específico do ADM: mais fresco."""
-    try:
-        sheet_u = ws_usuarios()
-        return gs_call(sheet_u.get_all_records)
-    except Exception:
-        return []
+    sheet_u = ws_usuarios()
+    return gs_call(sheet_u.get_all_records)
 
 def garantir_config_capacidade(sheet_c):
     """
@@ -377,7 +487,6 @@ def buscar_capacidade_onibus_dinamica():
     """
     try:
         sheet_c = ws_config()
-        garantir_config_capacidade(sheet_c)
         val = gs_call(sheet_c.acell, "B2").value
         capacidade = int(str(val).strip())
         return max(1, capacidade)
@@ -386,11 +495,10 @@ def buscar_capacidade_onibus_dinamica():
 
 @st.cache_data(ttl=6)
 def buscar_presenca_atualizada():
-    try:
-        sheet_p = ws_presenca()
-        return gs_call(sheet_p.get_all_values)
-    except Exception:
-        return None
+    # Se a leitura falhar, interrompe a operação em vez de fingir que a lista
+    # está vazia e permitir gravações ou exclusões incorretas.
+    sheet_p = ws_presenca()
+    return gs_call(sheet_p.get_all_values)
 
 @st.cache_data(ttl=30)
 def buscar_historico_dados():
@@ -489,26 +597,30 @@ def identificar_ciclo_da_lista(dados_p):
 
 def arquivar_lista_antes_de_limpar(dados_p):
     """
-    Copia a lista atual para a aba Historico antes de apagar a aba principal.
-    A função evita duplicidade usando CICLO_ID.
-    Em caso de falha no histórico, o app continua com o fluxo atual para não travar a lista.
+    Copia a lista atual para a aba Historico antes da limpeza.
+
+    Retorno:
+    - (True, "ARQUIVADA") quando gravou o histórico;
+    - (True, "JA_ARQUIVADA") quando o ciclo já estava salvo;
+    - (True, "VAZIA") quando não havia passageiros;
+    - (False, mensagem) quando houve falha.
+
+    A limpeza só é autorizada quando o retorno for True.
     """
     if not dados_p or len(dados_p) < 2:
-        return False
+        return True, "VAZIA"
 
     try:
         sheet_h = ws_historico()
-        ensure_historico_headers(sheet_h)
 
         ciclo_id, data_ciclo, embarque = identificar_ciclo_da_lista(dados_p)
         capacidade_onibus = buscar_capacidade_onibus_dinamica()
         prioridade_emails = obter_emails_prioridade(buscar_usuarios_cadastrados())
 
-        historico_atual = gs_call(sheet_h.get_all_values)
-        if historico_atual and len(historico_atual) > 1:
-            for row in historico_atual[1:]:
-                if row and str(row[0]).strip() == ciclo_id:
-                    return False
+        # Consulta somente a coluna de IDs, em vez de carregar todo o histórico.
+        ciclos_existentes = {str(v).strip() for v in gs_call(sheet_h.col_values, 1)[1:] if str(v).strip()}
+        if ciclo_id in ciclos_existentes:
+            return True, "JA_ARQUIVADA"
 
         arquivado_em = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
         linhas = []
@@ -527,131 +639,223 @@ def arquivar_lista_antes_de_limpar(dados_p):
                 r[3],  # NOME
                 r[4],  # LOTAÇÃO
                 r[5],  # EMAIL
-                str(capacidade_onibus),  # CAPACIDADE_ONIBUS
-                "SIM" if email_linha in prioridade_emails else "NAO",  # PRIORIDADE_LISTA
+                str(capacidade_onibus),
+                "SIM" if email_linha in prioridade_emails else "NAO",
             ])
 
         if linhas:
             gs_call(sheet_h.append_rows, linhas, value_input_option="USER_ENTERED")
             buscar_historico_dados.clear()
-            return True
-    except Exception:
-        # Não bloqueia o funcionamento atual do app caso o histórico falhe.
+            return True, "ARQUIVADA"
+
+        return True, "VAZIA"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def obter_estado_operacional(agora=None):
+    """
+    Fonte única das regras de abertura e do ciclo exibido no cabeçalho.
+    Isso impede que a lista diga uma coisa e a regra de acesso faça outra.
+    """
+    agora = agora or datetime.now(FUSO_BR)
+    t = agora.time()
+    wd = agora.weekday()  # seg=0 ... sex=4, sáb=5, dom=6
+
+    # Abertura da lista
+    if wd == 5:  # sábado
+        aberto = False
+    elif wd == 6:  # domingo
+        aberto = t >= time(19, 0)
+    elif wd == 4:  # sexta
+        aberto = not (time(5, 0) <= t < time(7, 0)) and t < time(17, 0)
+    else:  # segunda a quinta
+        aberto = not (
+            (time(5, 0) <= t < time(7, 0))
+            or (time(17, 0) <= t < time(19, 0))
+        )
+
+    janela_conferencia = (
+        time(5, 0) < t < time(7, 0)
+        or time(17, 0) < t < time(19, 0)
+    )
+
+    # Ciclo mostrado abaixo do título
+    if wd == 4:  # sexta
+        if t < time(7, 0):
+            data_ciclo = agora.date()
+            embarque = "06:30"
+        elif t < time(19, 0):
+            # Entre 17h e 19h a lista está fechada, mas continua pertencendo
+            # ao embarque das 18:30 da própria sexta-feira.
+            data_ciclo = agora.date()
+            embarque = "18:30"
+        else:
+            data_ciclo = (agora + timedelta(days=3)).date()
+            embarque = "06:30"
+    elif wd == 5:  # sábado
+        data_ciclo = (agora + timedelta(days=2)).date()
+        embarque = "06:30"
+    elif wd == 6:  # domingo
+        data_ciclo = (agora + timedelta(days=1)).date()
+        embarque = "06:30"
+    else:
+        if t >= time(19, 0):
+            data_ciclo = (agora + timedelta(days=1)).date()
+            embarque = "06:30"
+        elif t < time(7, 0):
+            data_ciclo = agora.date()
+            embarque = "06:30"
+        else:
+            data_ciclo = agora.date()
+            embarque = "18:30"
+
+    return {
+        "aberto": aberto,
+        "janela_conferencia": janela_conferencia,
+        "embarque": embarque,
+        "data_ciclo": data_ciclo,
+    }
+
+
+def obter_marco_limpeza(agora=None):
+    agora = agora or datetime.now(FUSO_BR)
+    t = agora.time()
+
+    if t >= time(18, 50):
+        return agora.replace(hour=18, minute=50, second=0, microsecond=0)
+    if t >= time(6, 50):
+        return agora.replace(hour=6, minute=50, second=0, microsecond=0)
+    return (agora - timedelta(days=1)).replace(hour=18, minute=50, second=0, microsecond=0)
+
+
+def lista_precisa_limpeza(dados_p, agora=None):
+    """
+    Só considera a lista antiga quando a inscrição mais recente também é
+    anterior ao marco. Isso impede apagar inscrições novas misturadas por
+    alguma sessão atrasada.
+    """
+    if not dados_p or len(dados_p) < 2:
         return False
 
-    return False
+    datas = []
+    for row in dados_p[1:]:
+        if row:
+            dt = _parse_data_hora_presenca(row[0])
+            if dt:
+                datas.append(dt)
+
+    if not datas:
+        return False
+
+    return max(datas) < obter_marco_limpeza(agora)
+
+
+def sincronizar_troca_de_ciclo(sheet_p, agora=None):
+    """
+    Releitura e troca de ciclo protegidas por um lock compartilhado.
+    Somente uma sessão pode arquivar e limpar; as demais, ao entrarem no
+    lock, encontram a planilha já limpa e não repetem a operação.
+    """
+    agora = agora or datetime.now(FUSO_BR)
+
+    with lock_operacoes_presenca():
+        dados_frescos = gs_call(sheet_p.get_all_values)
+        dados_validos = filtrar_linhas_presenca(dados_frescos)
+
+        if not lista_precisa_limpeza(dados_validos, agora):
+            return False, dados_validos, None
+
+        ok, status = arquivar_lista_antes_de_limpar(dados_validos)
+        if not ok:
+            return False, dados_validos, status
+
+        # Uma única chamada; preserva o cabeçalho e não redimensiona a aba.
+        gs_call(sheet_p.batch_clear, ["A2:F"])
+
+        header = dados_frescos[0] if dados_frescos else [
+            "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"
+        ]
+        return True, [header], None
 
 
 def verificar_status_e_limpar(sheet_p, dados_p):
     agora = datetime.now(FUSO_BR)
-    hora_atual, dia_semana = agora.time(), agora.weekday()
+    estado = obter_estado_operacional(agora)
 
-    if hora_atual >= time(18, 50):
-        marco = agora.replace(hour=18, minute=50, second=0, microsecond=0)
-    elif hora_atual >= time(6, 50):
-        marco = agora.replace(hour=6, minute=50, second=0, microsecond=0)
-    else:
-        marco = (agora - timedelta(days=1)).replace(hour=18, minute=50, second=0, microsecond=0)
+    # A leitura cacheada é usada apenas como gatilho. A decisão final sempre
+    # é tomada após nova leitura dentro do lock.
+    if lista_precisa_limpeza(dados_p, agora):
+        limpou, _dados_frescos, erro = sincronizar_troca_de_ciclo(sheet_p, agora)
 
-    if dados_p and len(dados_p) > 1:
-        try:
-            ultima_str = dados_p[-1][0]
-            ultima_dt = FUSO_BR.localize(datetime.strptime(ultima_str, "%d/%m/%Y %H:%M:%S"))
-            if ultima_dt < marco:
-                arquivar_lista_antes_de_limpar(dados_p)
-                gs_call(sheet_p.resize, rows=1)
-                gs_call(sheet_p.resize, rows=100)
-                st.session_state["_force_refresh_presenca"] = True
-                st.rerun()
-        except Exception:
-            pass
+        if erro:
+            st.error(
+                "Não foi possível concluir com segurança a troca de ciclo. "
+                "A lista ficará temporariamente bloqueada para evitar misturar ou apagar inscrições. "
+                f"Detalhe: {erro}"
+            )
+            return False, estado["janela_conferencia"]
 
-    # Regras de abertura/fechamento:
-    # - SEG a QUI: fecha apenas nas janelas 05:00-07:00 e 17:00-19:00
-    # - SEX: fecha às 17:00 e só reabre DOM às 19:00 (portanto SEX após 17:00 fica fechado)
-    # - SÁB: fechado o dia todo
-    # - DOM: abre a partir de 19:00
-    if dia_semana == 5:  # Sábado
-        is_aberto = False
-    elif dia_semana == 6:  # Domingo
-        is_aberto = (hora_atual >= time(19, 0))
-    elif dia_semana == 4:  # Sexta
-        if hora_atual >= time(17, 0):
-            is_aberto = False
-        elif time(5, 0) <= hora_atual < time(7, 0):
-            is_aberto = False
-        else:
-            is_aberto = True
-    else:  # Segunda a Quinta
-        if (time(5, 0) <= hora_atual < time(7, 0)) or (time(17, 0) <= hora_atual < time(19, 0)):
-            is_aberto = False
-        else:
-            is_aberto = True
+        if limpou:
+            st.session_state["_force_refresh_presenca"] = True
+            st.rerun()
 
-    janela_conferencia = (time(5, 0) < hora_atual < time(7, 0)) or (time(17, 0) < hora_atual < time(19, 0))
-    return is_aberto, janela_conferencia
+    return estado["aberto"], estado["janela_conferencia"]
+
+
+def registrar_presenca_se_ausente(sheet_p, usuario):
+    """Grava uma presença de forma serializada e impede duplicidade."""
+    email = str(usuario.get("Email", "")).strip().lower()
+
+    with lock_operacoes_presenca():
+        # Confere novamente o horário dentro do lock para impedir gravação
+        # exatamente após o fechamento da lista.
+        if not obter_estado_operacional()["aberto"]:
+            return False
+
+        # Garante que uma sessão aberta antes da virada não grave no ciclo antigo.
+        _limpou, dados_frescos, erro = sincronizar_troca_de_ciclo(sheet_p)
+        if erro:
+            raise RuntimeError(
+                "Não foi possível preparar o novo ciclo com segurança. " + str(erro)
+            )
+
+        for row in (dados_frescos or [])[1:]:
+            if len(row) >= 6 and str(row[5]).strip().lower() == email:
+                return False
+
+        agora_str = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+        gs_call(sheet_p.append_row, [
+            agora_str,
+            usuario.get("QG_RMCF_OUTROS") or "QG",
+            usuario.get("Graduação"),
+            usuario.get("Nome"),
+            usuario.get("Lotação"),
+            usuario.get("Email")
+        ])
+        return True
+
+
+def excluir_presenca_por_email(sheet_p, email):
+    """Exclui a presença com nova leitura dentro do mesmo lock das gravações."""
+    email = str(email or "").strip().lower()
+
+    with lock_operacoes_presenca():
+        dados_frescos = gs_call(sheet_p.get_all_values)
+        for row_number, row in enumerate(dados_frescos[1:], start=2):
+            if len(row) >= 6 and str(row[5]).strip().lower() == email:
+                gs_call(sheet_p.delete_rows, row_number)
+                return True
+    return False
 
 
 # ==========================================================
 # CICLO (exibição abaixo do título)
 # ==========================================================
 def obter_ciclo_atual():
-    """
-    Exibe o ciclo operacional ao qual a lista ainda se refere.
+    estado = obter_estado_operacional()
+    return estado["embarque"], estado["data_ciclo"].strftime("%d/%m/%Y")
 
-    Importante:
-    - "lista fechada" não significa, necessariamente, "ciclo encerrado";
-    - na sexta-feira, entre 17:00 e 19:00, a lista fica fechada para novas inscrições,
-      mas ainda se refere ao embarque de 18:30 da própria sexta;
-    - somente a partir de 19:00 de sexta o cabeçalho passa a apontar para o próximo
-      ciclo disponível, que é segunda-feira às 06:30.
-    """
-    agora = datetime.now(FUSO_BR)
-    t = agora.time()
-    wd = agora.weekday()  # seg=0 ... sex=4, sáb=5, dom=6
-
-    # SEXTA-FEIRA:
-    # Até antes das 19:00, mesmo com a lista fechada após 17:00, o ciclo exibido
-    # continua sendo o embarque das 18:30 da própria sexta-feira.
-    if wd == 4:
-        if t < time(7, 0):
-            alvo_dt = agora.date()
-            alvo_h = "06:30"
-        elif t < time(19, 0):
-            alvo_dt = agora.date()
-            alvo_h = "18:30"
-        else:
-            # Após 19:00 de sexta, o próximo ciclo é segunda-feira 06:30.
-            alvo_dt = (agora + timedelta(days=3)).date()
-            alvo_h = "06:30"
-
-    # SÁBADO:
-    # Fechado o dia todo; o próximo ciclo disponível é segunda-feira 06:30.
-    elif wd == 5:
-        alvo_dt = (agora + timedelta(days=2)).date()
-        alvo_h = "06:30"
-
-    # DOMINGO:
-    # Antes e depois das 19:00, o ciclo que será aberto é segunda-feira 06:30.
-    elif wd == 6:
-        alvo_dt = (agora + timedelta(days=1)).date()
-        alvo_h = "06:30"
-
-    # SEGUNDA A QUINTA:
-    # Mantém a lógica usual dos ciclos diários.
-    else:
-        if t >= time(19, 0):
-            alvo_dt = (agora + timedelta(days=1)).date()
-            alvo_h = "06:30"
-        elif t < time(7, 0):
-            alvo_dt = agora.date()
-            alvo_h = "06:30"
-        else:
-            alvo_dt = agora.date()
-            alvo_h = "18:30"
-
-    alvo_dt_str = alvo_dt.strftime("%d/%m/%Y")
-    return alvo_h, alvo_dt_str
 
 
 def aplicar_ordenacao(df, capacidade_onibus: int = CAPACIDADE_PADRAO_ONIBUS, prioridade_emails=None):
@@ -1257,15 +1461,9 @@ if "_confirmar_exclusao_presenca" not in st.session_state:
     st.session_state._confirmar_exclusao_presenca = False
 
 try:
+    # Verificação estrutural executada apenas uma vez por inicialização do app.
+    inicializar_estrutura_usuarios()
     sheet_u_escrita = ws_usuarios()
-
-    # Garante colunas auxiliares da aba Usuarios antes das leituras cacheadas.
-    try:
-        ensure_temp_cols(sheet_u_escrita)
-        ensure_prioridade_col(sheet_u_escrita)
-        ensure_admin_col(sheet_u_escrita)
-    except Exception:
-        pass
 
     # Leitura leve pro público
     records_u_public = buscar_usuarios_cadastrados()
@@ -1853,10 +2051,12 @@ try:
         sheet_p_escrita = ws_presenca()
 
         if st.session_state._force_refresh_presenca:
-            buscar_presenca_atualizada.clear()
+            # Atualização direta apenas para esta sessão. Não limpa o cache
+            # global e, portanto, não provoca avalanche de leituras nas demais.
+            dados_p = gs_call(sheet_p_escrita.get_all_values)
             st.session_state._force_refresh_presenca = False
-
-        dados_p = buscar_presenca_atualizada()
+        else:
+            dados_p = buscar_presenca_atualizada()
         dados_p_show = filtrar_linhas_presenca(dados_p)
 
         aberto, janela_conf = verificar_status_e_limpar(sheet_p_escrita, dados_p_show)
@@ -1905,29 +2105,17 @@ try:
 
                 if sim_btn:
                     email_logado = str(u.get("Email")).strip().lower()
-                    if dados_p and len(dados_p) > 1:
-                        for idx, r in enumerate(dados_p):
-                            if len(r) >= 6 and str(r[5]).strip().lower() == email_logado:
-                                gs_call(sheet_p_escrita.delete_rows, idx + 1)
-                                break
+                    excluir_presenca_por_email(sheet_p_escrita, email_logado)
 
                     st.session_state._confirmar_exclusao_presenca = False
-                    buscar_presenca_atualizada.clear()
+                    st.session_state._force_refresh_presenca = True
                     st.rerun()
 
         elif aberto:
             salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True)
             if salvar_btn:
-                agora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
-                gs_call(sheet_p_escrita.append_row, [
-                    agora,
-                    u.get("QG_RMCF_OUTROS") or "QG",
-                    u.get("Graduação"),
-                    u.get("Nome"),
-                    u.get("Lotação"),
-                    u.get("Email")
-                ])
-                buscar_presenca_atualizada.clear()
+                registrar_presenca_se_ausente(sheet_p_escrita, u)
+                st.session_state._force_refresh_presenca = True
                 st.rerun()
         else:
             st.info("⌛ Lista fechada para novas inscrições.")
@@ -1937,7 +2125,7 @@ try:
             # ==========================================================
             up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True, key="up_btn_fechado")
             if up_btn_fechado:
-                buscar_presenca_atualizada.clear()
+                st.session_state._force_refresh_presenca = True
                 st.rerun()
 
         # CONFERÊNCIA
@@ -1962,7 +2150,7 @@ try:
             with c_up1:
                 up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="up_btn_tabela")
                 if up_btn:
-                    buscar_presenca_atualizada.clear()
+                    st.session_state._force_refresh_presenca = True
                     st.rerun()
             with c_up2:
                 st.caption("Atualiza sob demanda.")
