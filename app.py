@@ -1201,7 +1201,13 @@ def registrar_presenca_se_ausente(sheet_p, usuario):
 
 
 def excluir_presenca_por_email(sheet_p, email):
-    """Exclui somente a própria presença sem formar fila de sessões."""
+    """
+    Exclui somente a própria presença sem formar fila de sessões.
+
+    A exclusão é confirmada por uma nova leitura direta do Google Sheets.
+    Caso existam duplicidades antigas do mesmo e-mail, todas são removidas de
+    baixo para cima para não deslocar os números das linhas ainda pendentes.
+    """
     email = str(email or "").strip().lower()
 
     lock, adquirido = adquirir_lock_mutacao()
@@ -1218,16 +1224,41 @@ def excluir_presenca_por_email(sheet_p, email):
             _max_tries=2,
             _max_sleep=1.0
         )
-        for row_number, row in enumerate(dados_frescos[1:], start=2):
-            if len(row) >= 6 and str(row[5]).strip().lower() == email:
-                gs_call(
-                    sheet_p.delete_rows,
-                    row_number,
-                    _max_tries=2,
-                    _max_sleep=1.0
-                )
-                return True, "EXCLUIDA"
-        return False, "NAO_ENCONTRADA"
+
+        linhas_encontradas = [
+            row_number
+            for row_number, row in enumerate(dados_frescos[1:], start=2)
+            if len(row) >= 6 and str(row[5]).strip().lower() == email
+        ]
+
+        if not linhas_encontradas:
+            return False, "NAO_ENCONTRADA"
+
+        for row_number in reversed(linhas_encontradas):
+            gs_call(
+                sheet_p.delete_rows,
+                row_number,
+                _max_tries=2,
+                _max_sleep=1.0
+            )
+
+        # Confirma que a exclusão realmente chegou ao Sheets antes de informar
+        # sucesso para a interface.
+        dados_confirmacao = gs_call(
+            sheet_p.get_all_values,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        ainda_existe = any(
+            len(row) >= 6 and str(row[5]).strip().lower() == email
+            for row in (dados_confirmacao or [])[1:]
+        )
+
+        if ainda_existe:
+            LOGGER.error("Exclusão não confirmada para o e-mail %s.", email)
+            return False, "EXCLUSAO_NAO_CONFIRMADA"
+
+        return True, "EXCLUIDA"
 
     except Exception:
         LOGGER.exception("Falha ao excluir presença.")
@@ -1846,6 +1877,18 @@ if "_tel_cad_fmt" not in st.session_state:
 # ==========================================================
 if "_confirmar_exclusao_presenca" not in st.session_state:
     st.session_state._confirmar_exclusao_presenca = False
+
+# Depois de uma gravação, a exclusão somente é liberada quando uma leitura
+# direta do Google Sheets confirmar que a presença realmente foi persistida.
+if "_presenca_aguardando_confirmacao" not in st.session_state:
+    st.session_state._presenca_aguardando_confirmacao = False
+
+# Durante alguns segundos após gravar/excluir ou enquanto a confirmação de
+# exclusão estiver aberta, esta sessão ignora o cache da lista. Isso evita que
+# um rerun mostre uma versão antiga e apenas "simule" a exclusão na tela.
+if "_leitura_direta_presenca_ate" not in st.session_state:
+    st.session_state._leitura_direta_presenca_ate = 0.0
+
 if "_flash_operacao" not in st.session_state:
     st.session_state._flash_operacao = None
 
@@ -2450,10 +2493,24 @@ try:
 
         sheet_p_escrita = ws_presenca()
 
-        if st.session_state._force_refresh_presenca:
+        agora_monotonic = time_module.monotonic()
+        usar_leitura_direta = (
+            bool(st.session_state._force_refresh_presenca)
+            or bool(st.session_state._confirmar_exclusao_presenca)
+            or bool(st.session_state._presenca_aguardando_confirmacao)
+            or agora_monotonic < float(st.session_state._leitura_direta_presenca_ate or 0.0)
+        )
+
+        if usar_leitura_direta:
             # Atualização direta apenas para esta sessão. Não limpa o cache
             # global e, portanto, não provoca avalanche de leituras nas demais.
-            dados_p = gs_call(sheet_p_escrita.get_all_values)
+            # É obrigatória durante a confirmação/exclusão para que nenhum
+            # rerun utilize uma lista anterior à gravação recém-realizada.
+            dados_p = gs_call(
+                sheet_p_escrita.get_all_values,
+                _max_tries=2,
+                _max_sleep=1.0
+            )
             st.session_state._force_refresh_presenca = False
         else:
             dados_p = buscar_presenca_atualizada()
@@ -2476,16 +2533,44 @@ try:
                 pos_idx = df_o.index[df_o["EMAIL"].str.lower() == email_logado].tolist()[0]
                 pos = str(df_o.loc[pos_idx, "Nº"])
 
-        if ja:
-            st.success(f"✅ Presença registrada: {pos}")
+        # A presença recém-gravada só é considerada pronta para exclusão depois
+        # que esta leitura direta comprovar que o e-mail já existe no Sheets.
+        presenca_confirmada_nesta_execucao = bool(
+            ja and st.session_state._presenca_aguardando_confirmacao
+        )
+        if presenca_confirmada_nesta_execucao:
+            st.session_state._presenca_aguardando_confirmacao = False
+
+        if ja or st.session_state._confirmar_exclusao_presenca:
+            if ja:
+                st.success(f"✅ Presença registrada: {pos}")
+            else:
+                # Mantém o fluxo de confirmação visível mesmo diante de uma
+                # leitura transitória. O botão SIM fará nova leitura direta.
+                st.warning("A presença está sendo validada diretamente no Google Sheets.")
 
             # ==========================================================
-            # ALTERAÇÃO SOLICITADA: confirmação antes de excluir
+            # EXCLUSÃO SEGURA:
+            # - botão só é liberado após confirmação direta da gravação;
+            # - abrir a confirmação força novas leituras diretas;
+            # - a caixa não desaparece por causa de cache antigo.
             # ==========================================================
-            exc_btn = st.button("❌ EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_presenca")
-            if exc_btn:
-                st.session_state._confirmar_exclusao_presenca = True
-                st.rerun()
+            if not st.session_state._confirmar_exclusao_presenca:
+                exc_btn = st.button(
+                    "❌ EXCLUIR MINHA PRESENÇA ⚠️",
+                    use_container_width=True,
+                    key="btn_excluir_presenca",
+                    disabled=bool(st.session_state._presenca_aguardando_confirmacao)
+                )
+
+                if st.session_state._presenca_aguardando_confirmacao:
+                    st.caption("Aguardando o Google Sheets confirmar a gravação da presença.")
+
+                if exc_btn:
+                    st.session_state._confirmar_exclusao_presenca = True
+                    st.session_state._force_refresh_presenca = True
+                    st.session_state._leitura_direta_presenca_ate = time_module.monotonic() + 15.0
+                    st.rerun()
 
             if st.session_state._confirmar_exclusao_presenca:
                 st.warning("⚠️ Você realmente deseja **excluir sua presença**?")
@@ -2501,6 +2586,8 @@ try:
 
                 if nao_btn or cancel_btn:
                     st.session_state._confirmar_exclusao_presenca = False
+                    st.session_state._force_refresh_presenca = True
+                    st.session_state._leitura_direta_presenca_ate = time_module.monotonic() + 5.0
                     st.rerun()
 
                 if sim_btn:
@@ -2509,25 +2596,58 @@ try:
 
                     if excluiu:
                         st.session_state._confirmar_exclusao_presenca = False
+                        st.session_state._presenca_aguardando_confirmacao = False
                         st.session_state._force_refresh_presenca = True
+                        st.session_state._leitura_direta_presenca_ate = time_module.monotonic() + 10.0
                         st.session_state._flash_operacao = ("success", "✅ Presença excluída com sucesso.")
                         st.rerun()
                     elif status_exclusao in {"SISTEMA_OCUPADO", "TROCA_EM_ANDAMENTO"}:
                         st.warning("O sistema está concluindo outra operação. Aguarde alguns segundos e tente novamente.")
                     elif status_exclusao == "NAO_ENCONTRADA":
                         st.session_state._confirmar_exclusao_presenca = False
+                        st.session_state._presenca_aguardando_confirmacao = False
                         st.session_state._force_refresh_presenca = True
+                        st.session_state._leitura_direta_presenca_ate = time_module.monotonic() + 10.0
                         st.session_state._flash_operacao = ("warning", "Sua presença já não estava mais na lista.")
                         st.rerun()
+                    elif status_exclusao == "EXCLUSAO_NAO_CONFIRMADA":
+                        st.error(
+                            "A exclusão foi solicitada, mas ainda não pôde ser confirmada no Google Sheets. "
+                            "A confirmação permanecerá aberta para uma nova tentativa segura."
+                        )
                     else:
                         st.error("Não foi possível excluir sua presença agora. Atualize e tente novamente.")
+
+        elif st.session_state._presenca_aguardando_confirmacao:
+            st.info("⏳ Confirmando sua presença diretamente no Google Sheets...")
+            _ = st.button(
+                "❌ EXCLUIR MINHA PRESENÇA ⚠️",
+                use_container_width=True,
+                key="btn_excluir_presenca_aguardando",
+                disabled=True
+            )
+            confirmar_btn = st.button(
+                "🔄 ATUALIZAR E CONFIRMAR PRESENÇA",
+                use_container_width=True,
+                key="btn_atualizar_confirmacao_presenca"
+            )
+            if confirmar_btn:
+                st.session_state._force_refresh_presenca = True
+                st.session_state._leitura_direta_presenca_ate = time_module.monotonic() + 10.0
+                st.rerun()
 
         elif aberto:
             salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True)
             if salvar_btn:
                 gravou, status_gravacao = registrar_presenca_se_ausente(sheet_p_escrita, u)
                 if gravou:
+                    # Não libera a exclusão com base apenas no retorno do append.
+                    # O próximo rerun fará leitura direta e só então confirmará
+                    # que a presença realmente existe no Google Sheets.
+                    st.session_state._confirmar_exclusao_presenca = False
+                    st.session_state._presenca_aguardando_confirmacao = True
                     st.session_state._force_refresh_presenca = True
+                    st.session_state._leitura_direta_presenca_ate = time_module.monotonic() + 12.0
                     st.rerun()
                 elif status_gravacao == "JA_REGISTRADA":
                     st.session_state._force_refresh_presenca = True
