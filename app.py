@@ -13,6 +13,7 @@ import re
 import threading
 import logging
 import uuid
+import json
 
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
@@ -356,6 +357,20 @@ def ws_auditoria():
                 )
                 gs_call(sheet_a.update, "A1", [AUDITORIA_HEADERS])
 
+        # A versão com restauração utiliza colunas adicionais. Caso a aba
+        # Auditoria já exista no Google Sheets com a estrutura antiga, amplia a
+        # grade antes de atualizar o cabeçalho, preservando todos os registros.
+        linhas_atuais = max(1, int(getattr(sheet_a, "row_count", 0) or 1))
+        colunas_atuais = int(getattr(sheet_a, "col_count", 0) or 0)
+        if colunas_atuais < len(AUDITORIA_HEADERS):
+            gs_call(
+                sheet_a.resize,
+                rows=linhas_atuais,
+                cols=len(AUDITORIA_HEADERS),
+                _max_tries=3,
+                _max_sleep=1.5
+            )
+
         headers = [str(h).strip() for h in gs_call(sheet_a.row_values, 1)]
         if headers[:len(AUDITORIA_HEADERS)] != AUDITORIA_HEADERS:
             gs_call(sheet_a.update, "A1", [AUDITORIA_HEADERS])
@@ -382,7 +397,14 @@ AUDITORIA_HEADERS = [
     "ID_AUDITORIA", "DATA_HORA", "RESULTADO",
     "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
     "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
-    "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE", "USUARIO_STATUS"
+    "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE", "USUARIO_STATUS",
+    # Backup completo da linha original da aba Usuarios. Ele permite restaurar
+    # senha, prioridade, acesso ADM e quaisquer outras colunas existentes no
+    # momento da exclusão, sem depender apenas dos campos exibidos na grid.
+    "DADOS_USUARIO_JSON",
+    "RESTAURACAO_RESULTADO", "RESTAURADO_EM",
+    "RESTAURADO_POR_TIPO", "RESTAURADO_POR_NOME", "RESTAURADO_POR_EMAIL",
+    "RESTAURACAO_OBSERVACAO"
 ]
 
 
@@ -990,6 +1012,18 @@ def excluir_usuario_com_auditoria(
         usuario_telefone = valor_usuario("TELEFONE", "TELEFONE")
         usuario_status = valor_usuario("STATUS")
 
+        # Preserva a linha completa, inclusive Senha, PRIORIDADE_LISTA,
+        # ACESSO_ADM e eventuais colunas futuras existentes em Usuarios.
+        snapshot_usuario = {
+            headers[indice]: (valores_usuario[indice] if indice < len(valores_usuario) else "")
+            for indice in range(len(headers))
+        }
+        snapshot_usuario_json = json.dumps(
+            snapshot_usuario,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
         # A auditoria é criada antes da exclusão. Assim, nunca há exclusão
         # intencional sem ao menos um registro PENDENTE/FALHA no histórico.
         sheet_a = ws_auditoria()
@@ -1008,6 +1042,13 @@ def excluir_usuario_com_auditoria(
             usuario_email,
             usuario_telefone,
             usuario_status,
+            snapshot_usuario_json,
+            "",  # RESTAURACAO_RESULTADO
+            "",  # RESTAURADO_EM
+            "",  # RESTAURADO_POR_TIPO
+            "",  # RESTAURADO_POR_NOME
+            "",  # RESTAURADO_POR_EMAIL
+            "",  # RESTAURACAO_OBSERVACAO
         ]
 
         gs_call(
@@ -1039,6 +1080,7 @@ def excluir_usuario_com_auditoria(
         if (
             str(confirmacao_auditoria[0]).strip() != audit_id
             or str(confirmacao_auditoria[10]).strip().lower() != email_norm
+            or not str(confirmacao_auditoria[13]).strip()
         ):
             raise RuntimeError("Os dados do registro de auditoria não foram confirmados.")
 
@@ -1116,6 +1158,292 @@ def excluir_usuario_com_auditoria(
         except Exception:
             pass
         return False, "ERRO_EXCLUSAO"
+
+    finally:
+        lock.release()
+
+
+
+# ==========================================================
+# RESTAURAÇÃO DE CADASTRO PELA AUDITORIA
+# ==========================================================
+def restaurar_usuario_da_auditoria(
+    sheet_u,
+    audit_id: str,
+    admin_tipo: str,
+    admin_nome: str,
+    admin_email: str,
+):
+    """
+    Restaura na aba Usuarios o cadastro completo preservado no momento da
+    exclusão. A operação é exclusiva da tela Auditoria, que só aceita o login
+    do Administrador Mestre.
+
+    Segurança aplicada:
+    - impede restauração duplicada;
+    - impede colisão com e-mail ou telefone já usados por outro cadastro;
+    - restaura os valores de acordo com o cabeçalho atual da aba Usuarios;
+    - invalida tokens temporários antigos;
+    - confirma a gravação diretamente no Google Sheets;
+    - registra quem restaurou, quando e o resultado da operação.
+    """
+    audit_id = str(audit_id or "").strip()
+    if not audit_id:
+        return False, "ID_AUDITORIA_INVALIDO"
+
+    lock, adquirido = adquirir_lock_mutacao()
+    if not adquirido:
+        return False, "SISTEMA_OCUPADO"
+
+    sheet_a = None
+    linha_auditoria = None
+    colunas_a = {}
+
+    def atualizar_campo_auditoria(nome_campo, valor, tentativas=3):
+        if sheet_a is None or linha_auditoria is None or nome_campo not in colunas_a:
+            return
+        gs_call(
+            sheet_a.update_cell,
+            linha_auditoria,
+            colunas_a[nome_campo],
+            str(valor or ""),
+            _max_tries=tentativas,
+            _max_sleep=1.5
+        )
+
+    try:
+        status_coord, _ = coordenador_troca_ciclo().obter_status()
+        if status_coord == "EM_ANDAMENTO":
+            return False, "TROCA_EM_ANDAMENTO"
+
+        sheet_a = ws_auditoria()
+        dados_a = gs_call(
+            sheet_a.get_all_values,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        if not dados_a or len(dados_a) < 2:
+            return False, "REGISTRO_AUDITORIA_NAO_ENCONTRADO"
+
+        headers_a = [str(h).strip() for h in dados_a[0]]
+        colunas_a = {h: i + 1 for i, h in enumerate(headers_a)}
+
+        valores_a = None
+        for numero_linha, row in enumerate(dados_a[1:], start=2):
+            r = list(row) + [""] * (len(headers_a) - len(row))
+            if str(r[0]).strip() == audit_id:
+                linha_auditoria = numero_linha
+                valores_a = r
+                break
+
+        if linha_auditoria is None or valores_a is None:
+            return False, "REGISTRO_AUDITORIA_NAO_ENCONTRADO"
+
+        registro_a = {
+            headers_a[i]: (valores_a[i] if i < len(valores_a) else "")
+            for i in range(len(headers_a))
+        }
+
+        resultado_exclusao = str(registro_a.get("RESULTADO", "")).strip().upper()
+        resultado_restauracao = str(
+            registro_a.get("RESTAURACAO_RESULTADO", "")
+        ).strip().upper()
+
+        if resultado_exclusao != "EXCLUIDO":
+            return False, "EXCLUSAO_NAO_CONFIRMADA"
+        if resultado_restauracao == "RESTAURADO":
+            return False, "JA_RESTAURADO"
+
+        snapshot_json = str(registro_a.get("DADOS_USUARIO_JSON", "") or "").strip()
+        if not snapshot_json:
+            return False, "BACKUP_COMPLETO_INDISPONIVEL"
+
+        try:
+            snapshot = json.loads(snapshot_json)
+        except Exception:
+            return False, "BACKUP_COMPLETO_INVALIDO"
+
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False, "BACKUP_COMPLETO_INVALIDO"
+
+        dados_u = gs_call(
+            sheet_u.get_all_values,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        if not dados_u:
+            return False, "CABECALHO_USUARIOS_NAO_ENCONTRADO"
+
+        headers_u = [str(h).strip() for h in dados_u[0]]
+        if not headers_u:
+            return False, "CABECALHO_USUARIOS_NAO_ENCONTRADO"
+
+        snapshot_norm = {
+            str(chave or "").strip().upper(): str(valor or "")
+            for chave, valor in snapshot.items()
+        }
+
+        defaults = {
+            "TEMP_SENHA": "",
+            "TEMP_EXPIRA": "",
+            "TEMP_USADA": "SIM",
+            PRIORIDADE_HEADER.upper(): "NAO",
+            ADMIN_HEADER.upper(): "NAO",
+        }
+
+        linha_restaurada = []
+        for header in headers_u:
+            chave = str(header or "").strip().upper()
+            if chave in {"TEMP_SENHA", "TEMP_EXPIRA", "TEMP_USADA"}:
+                # Não reaproveita token de recuperação antigo. A senha real do
+                # cadastro permanece restaurada normalmente pela coluna Senha.
+                valor = defaults[chave]
+            elif chave in snapshot_norm:
+                valor = snapshot_norm[chave]
+            else:
+                valor = defaults.get(chave, "")
+            linha_restaurada.append(valor)
+
+        headers_u_upper = [h.upper() for h in headers_u]
+        if "EMAIL" not in headers_u_upper:
+            return False, "COLUNA_EMAIL_NAO_ENCONTRADA"
+
+        email_idx = headers_u_upper.index("EMAIL")
+        email_restaurar = str(linha_restaurada[email_idx] or "").strip().lower()
+        if not email_restaurar:
+            email_restaurar = str(registro_a.get("USUARIO_EMAIL", "") or "").strip().lower()
+            linha_restaurada[email_idx] = email_restaurar
+        if not email_restaurar:
+            return False, "EMAIL_INVALIDO"
+
+        tel_idx = headers_u_upper.index("TELEFONE") if "TELEFONE" in headers_u_upper else None
+        telefone_restaurar = (
+            tel_only_digits(linha_restaurada[tel_idx])
+            if tel_idx is not None
+            else ""
+        )
+
+        # Confere se uma tentativa anterior chegou a gravar o usuário, mas não
+        # conseguiu finalizar a atualização do status na Auditoria.
+        usuario_existente = None
+        for row in dados_u[1:]:
+            r = list(row) + [""] * (len(headers_u) - len(row))
+            if str(r[email_idx]).strip().lower() == email_restaurar:
+                usuario_existente = r
+                break
+
+        if usuario_existente is not None:
+            campos_iguais = all(
+                str(usuario_existente[i] or "").strip() == str(linha_restaurada[i] or "").strip()
+                for i in range(len(headers_u))
+            )
+            if campos_iguais and resultado_restauracao in {
+                "PENDENTE", "FALHA_RESTAURACAO", ""
+            }:
+                agora_str = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+                atualizar_campo_auditoria("RESTAURACAO_RESULTADO", "RESTAURADO")
+                atualizar_campo_auditoria("RESTAURADO_EM", agora_str)
+                atualizar_campo_auditoria("RESTAURADO_POR_TIPO", admin_tipo)
+                atualizar_campo_auditoria("RESTAURADO_POR_NOME", admin_nome)
+                atualizar_campo_auditoria("RESTAURADO_POR_EMAIL", admin_email)
+                atualizar_campo_auditoria(
+                    "RESTAURACAO_OBSERVACAO",
+                    "Cadastro já estava gravado; auditoria finalizada nesta tentativa."
+                )
+                buscar_usuarios_admin.clear()
+                buscar_usuarios_cadastrados.clear()
+                buscar_auditoria_dados.clear()
+                return True, "RESTAURADO"
+
+            return False, "EMAIL_JA_CADASTRADO"
+
+        if tel_idx is not None and telefone_restaurar:
+            for row in dados_u[1:]:
+                r = list(row) + [""] * (len(headers_u) - len(row))
+                if tel_only_digits(r[tel_idx]) == telefone_restaurar:
+                    return False, "TELEFONE_JA_CADASTRADO"
+
+        agora_str = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+        atualizar_campo_auditoria("RESTAURACAO_RESULTADO", "PENDENTE")
+        atualizar_campo_auditoria("RESTAURADO_EM", agora_str)
+        atualizar_campo_auditoria("RESTAURADO_POR_TIPO", admin_tipo)
+        atualizar_campo_auditoria("RESTAURADO_POR_NOME", admin_nome)
+        atualizar_campo_auditoria("RESTAURADO_POR_EMAIL", admin_email)
+        atualizar_campo_auditoria("RESTAURACAO_OBSERVACAO", "Restauração iniciada.")
+
+        gs_call(
+            sheet_u.append_row,
+            linha_restaurada,
+            value_input_option="USER_ENTERED",
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+
+        dados_confirmacao = gs_call(
+            sheet_u.get_all_values,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        usuario_confirmado = None
+        for row in (dados_confirmacao or [])[1:]:
+            r = list(row) + [""] * (len(headers_u) - len(row))
+            if str(r[email_idx]).strip().lower() == email_restaurar:
+                usuario_confirmado = r
+                break
+
+        if usuario_confirmado is None:
+            raise RuntimeError("O cadastro restaurado não foi localizado na aba Usuarios.")
+
+        campos_confirmados = all(
+            str(usuario_confirmado[i] or "").strip() == str(linha_restaurada[i] or "").strip()
+            for i in range(len(headers_u))
+        )
+        if not campos_confirmados:
+            raise RuntimeError("Os dados restaurados não foram confirmados integralmente.")
+
+        atualizar_campo_auditoria("RESTAURACAO_RESULTADO", "RESTAURADO")
+        atualizar_campo_auditoria("RESTAURADO_EM", agora_str)
+        atualizar_campo_auditoria("RESTAURADO_POR_TIPO", admin_tipo)
+        atualizar_campo_auditoria("RESTAURADO_POR_NOME", admin_nome)
+        atualizar_campo_auditoria("RESTAURADO_POR_EMAIL", admin_email)
+        atualizar_campo_auditoria(
+            "RESTAURACAO_OBSERVACAO",
+            "Cadastro restaurado e confirmado na aba Usuarios."
+        )
+
+        # Confirma a conclusão na própria Auditoria.
+        resultado_final = gs_call(
+            sheet_a.cell,
+            linha_auditoria,
+            colunas_a["RESTAURACAO_RESULTADO"],
+            _max_tries=2,
+            _max_sleep=1.0
+        ).value
+        if str(resultado_final or "").strip().upper() != "RESTAURADO":
+            raise RuntimeError("A conclusão da restauração não foi confirmada na Auditoria.")
+
+        buscar_usuarios_admin.clear()
+        buscar_usuarios_cadastrados.clear()
+        buscar_auditoria_dados.clear()
+        return True, "RESTAURADO"
+
+    except Exception as exc:
+        LOGGER.exception("Falha ao restaurar cadastro pela Auditoria.")
+        try:
+            atualizar_campo_auditoria("RESTAURACAO_RESULTADO", "FALHA_RESTAURACAO", tentativas=2)
+            atualizar_campo_auditoria(
+                "RESTAURACAO_OBSERVACAO",
+                f"{type(exc).__name__}: {exc}"[:500],
+                tentativas=2
+            )
+        except Exception:
+            LOGGER.exception("Não foi possível registrar a falha da restauração na Auditoria.")
+
+        try:
+            buscar_auditoria_dados.clear()
+        except Exception:
+            pass
+        return False, "ERRO_RESTAURACAO"
 
     finally:
         lock.release()
@@ -2368,6 +2696,10 @@ if "is_auditoria" not in st.session_state:
     st.session_state.is_auditoria = False
 if "_auditoria_first_load" not in st.session_state:
     st.session_state._auditoria_first_load = False
+if "_confirmar_restauracao_audit_id" not in st.session_state:
+    st.session_state._confirmar_restauracao_audit_id = ""
+if "_auditoria_flash" not in st.session_state:
+    st.session_state._auditoria_flash = None
 if "_confirmar_exclusao_usuario_email" not in st.session_state:
     st.session_state._confirmar_exclusao_usuario_email = ""
 
@@ -3117,9 +3449,20 @@ try:
     elif st.session_state.is_auditoria:
         st.header("🧾 AUDITORIA DE EXCLUSÕES 🧾")
         st.caption(
-            "Histórico de exclusões de cadastros. O acesso a esta tela é exclusivo "
-            "do Administrador Mestre."
+            "Histórico de exclusões e restaurações de cadastros. O acesso a esta tela "
+            "é exclusivo do Administrador Mestre."
         )
+
+        auditoria_flash = st.session_state.get("_auditoria_flash")
+        if auditoria_flash:
+            tipo_flash, texto_flash = auditoria_flash
+            st.session_state._auditoria_flash = None
+            if tipo_flash == "success":
+                st.success(texto_flash)
+            elif tipo_flash == "warning":
+                st.warning(texto_flash)
+            else:
+                st.error(texto_flash)
 
         c_sair_aud, c_atualizar_aud = st.columns([1, 1])
         with c_sair_aud:
@@ -3136,6 +3479,7 @@ try:
         if sair_auditoria:
             st.session_state.is_auditoria = False
             st.session_state._auditoria_first_load = False
+            st.session_state._confirmar_restauracao_audit_id = ""
             st.rerun()
 
         if st.session_state._auditoria_first_load or atualizar_auditoria:
@@ -3176,7 +3520,8 @@ try:
                     "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
                     "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
                     "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE",
-                    "RESULTADO"
+                    "RESULTADO", "RESTAURACAO_RESULTADO",
+                    "RESTAURADO_POR_NOME", "RESTAURADO_POR_EMAIL"
                 ]
                 mascara = pd.Series(False, index=df_aud.index)
                 for coluna in colunas_pesquisa:
@@ -3193,11 +3538,13 @@ try:
                 "DATA_HORA", "RESULTADO",
                 "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
                 "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE",
-                "USUARIO_STATUS", "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL"
+                "USUARIO_STATUS", "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
+                "RESTAURACAO_RESULTADO", "RESTAURADO_EM",
+                "RESTAURADO_POR_NOME", "RESTAURADO_POR_EMAIL"
             ]
             df_grid = df_aud[colunas_grid].rename(columns={
-                "DATA_HORA": "Data/Hora",
-                "RESULTADO": "Resultado",
+                "DATA_HORA": "Excluído em",
+                "RESULTADO": "Resultado da exclusão",
                 "USUARIO_GRADUACAO": "Graduação",
                 "USUARIO_NOME": "Usuário excluído",
                 "USUARIO_LOTACAO": "Lotação",
@@ -3206,8 +3553,12 @@ try:
                 "USUARIO_TELEFONE": "Telefone",
                 "USUARIO_STATUS": "Status anterior",
                 "ADMIN_TIPO": "Tipo de ADM",
-                "ADMIN_NOME": "Administrador responsável",
+                "ADMIN_NOME": "Administrador que excluiu",
                 "ADMIN_EMAIL": "E-mail do administrador",
+                "RESTAURACAO_RESULTADO": "Resultado da restauração",
+                "RESTAURADO_EM": "Restaurado em",
+                "RESTAURADO_POR_NOME": "Restaurado por",
+                "RESTAURADO_POR_EMAIL": "E-mail de quem restaurou",
             })
 
             st.dataframe(
@@ -3215,6 +3566,155 @@ try:
                 use_container_width=True,
                 hide_index=True
             )
+
+            # ------------------------------------------------------
+            # RESTAURAÇÃO DE CADASTRO - SOMENTE ADM MESTRE
+            # ------------------------------------------------------
+            st.divider()
+            st.subheader("♻️ Restaurar cadastro excluído")
+            st.caption(
+                "A restauração devolve o cadastro completo à aba Usuarios, incluindo "
+                "senha, status, prioridade e eventual acesso ADM que existiam no momento "
+                "da exclusão. A presença na lista atual não é restaurada."
+            )
+
+            resultado_exclusao_norm = df_aud["RESULTADO"].astype(str).str.strip().str.upper()
+            resultado_restauracao_norm = (
+                df_aud["RESTAURACAO_RESULTADO"].astype(str).str.strip().str.upper()
+            )
+            possui_backup = df_aud["DADOS_USUARIO_JSON"].astype(str).str.strip().ne("")
+
+            df_restauraveis = df_aud[
+                resultado_exclusao_norm.eq("EXCLUIDO")
+                & ~resultado_restauracao_norm.eq("RESTAURADO")
+                & possui_backup
+            ].copy()
+
+            if df_restauraveis.empty:
+                qtd_sem_backup = int(
+                    (
+                        resultado_exclusao_norm.eq("EXCLUIDO")
+                        & ~resultado_restauracao_norm.eq("RESTAURADO")
+                        & ~possui_backup
+                    ).sum()
+                )
+                if qtd_sem_backup:
+                    st.info(
+                        "Os registros antigos foram criados antes do backup completo do "
+                        "cadastro e, por isso, não podem ser restaurados automaticamente. "
+                        "As novas exclusões feitas por esta versão terão restauração disponível."
+                    )
+                else:
+                    st.info("Não há cadastro excluído pendente de restauração.")
+            else:
+                opcoes_restauracao = {}
+                for _, registro in df_restauraveis.iterrows():
+                    audit_id_reg = str(registro.get("ID_AUDITORIA", "") or "").strip()
+                    label = (
+                        f"{registro.get('DATA_HORA', '')} | "
+                        f"{registro.get('USUARIO_GRADUACAO', '')} "
+                        f"{registro.get('USUARIO_NOME', '')} | "
+                        f"{registro.get('USUARIO_EMAIL', '')} | ID {audit_id_reg[:8]}"
+                    )
+                    opcoes_restauracao[label] = audit_id_reg
+
+                label_escolhido = st.selectbox(
+                    "Selecione o cadastro que será restaurado:",
+                    list(opcoes_restauracao.keys()),
+                    key="auditoria_selecao_restauracao"
+                )
+                audit_id_escolhido = opcoes_restauracao[label_escolhido]
+                registro_escolhido = df_restauraveis[
+                    df_restauraveis["ID_AUDITORIA"].astype(str) == audit_id_escolhido
+                ].iloc[0]
+
+                solicitar_restauracao = st.button(
+                    "♻️ RESTAURAR CADASTRO SELECIONADO",
+                    use_container_width=True,
+                    key="btn_solicitar_restauracao"
+                )
+                if solicitar_restauracao:
+                    st.session_state._confirmar_restauracao_audit_id = audit_id_escolhido
+
+                if (
+                    st.session_state.get("_confirmar_restauracao_audit_id", "")
+                    == audit_id_escolhido
+                ):
+                    st.warning(
+                        f"⚠️ Confirma a restauração do cadastro de **"
+                        f"{registro_escolhido.get('USUARIO_GRADUACAO', '')} "
+                        f"{registro_escolhido.get('USUARIO_NOME', '')}** "
+                        f"({registro_escolhido.get('USUARIO_EMAIL', '')})?"
+                    )
+                    st.caption(
+                        "O cadastro será recriado com os dados que possuía no momento da "
+                        "exclusão. A operação também ficará registrada nesta Auditoria."
+                    )
+                    c_confirmar_rest, c_cancelar_rest = st.columns([1, 1])
+                    confirmar_rest = c_confirmar_rest.button(
+                        "✅ SIM, RESTAURAR CADASTRO",
+                        type="primary",
+                        use_container_width=True,
+                        key="btn_confirmar_restauracao"
+                    )
+                    cancelar_rest = c_cancelar_rest.button(
+                        "↩️ CANCELAR",
+                        use_container_width=True,
+                        key="btn_cancelar_restauracao"
+                    )
+
+                    if cancelar_rest:
+                        st.session_state._confirmar_restauracao_audit_id = ""
+                        st.rerun()
+
+                    if confirmar_rest:
+                        restaurou, status_restauracao = restaurar_usuario_da_auditoria(
+                            sheet_u_escrita,
+                            audit_id_escolhido,
+                            "MESTRE",
+                            "ADMINISTRADOR MESTRE",
+                            "MASTER",
+                        )
+                        st.session_state._confirmar_restauracao_audit_id = ""
+
+                        if restaurou:
+                            st.session_state._auditoria_flash = (
+                                "success",
+                                f"✅ Cadastro de {registro_escolhido.get('USUARIO_NOME', '')} "
+                                "restaurado e confirmado na aba Usuarios."
+                            )
+                            st.rerun()
+                        elif status_restauracao in {
+                            "SISTEMA_OCUPADO", "TROCA_EM_ANDAMENTO"
+                        }:
+                            st.warning(
+                                "O sistema está concluindo outra operação. Aguarde alguns "
+                                "segundos e tente novamente."
+                            )
+                        elif status_restauracao == "JA_RESTAURADO":
+                            st.warning("Esse cadastro já havia sido restaurado.")
+                        elif status_restauracao == "EMAIL_JA_CADASTRADO":
+                            st.error(
+                                "Não foi possível restaurar porque já existe outro cadastro "
+                                "com o mesmo e-mail."
+                            )
+                        elif status_restauracao == "TELEFONE_JA_CADASTRADO":
+                            st.error(
+                                "Não foi possível restaurar porque o telefone já está sendo "
+                                "utilizado por outro cadastro."
+                            )
+                        elif status_restauracao in {
+                            "BACKUP_COMPLETO_INDISPONIVEL", "BACKUP_COMPLETO_INVALIDO"
+                        }:
+                            st.error(
+                                "Esse registro não possui o backup completo necessário para "
+                                "uma restauração automática segura."
+                            )
+                        else:
+                            st.error(
+                                "Não foi possível concluir a restauração com segurança. "
+                                "Atualize a Auditoria e tente novamente."
+                            )
 
     # =========================================
     # USUÁRIO LOGADO
