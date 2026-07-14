@@ -12,6 +12,7 @@ import random
 import re
 import threading
 import logging
+import uuid
 
 # ==========================================================
 # CONFIGURAÇÃO DE ACESSO
@@ -25,6 +26,7 @@ SPREADSHEET_NAME = "ListaPresenca"
 WS_USUARIOS = "Usuarios"
 WS_CONFIG = "Config"
 WS_HISTORICO = "Historico"
+WS_AUDITORIA = "Auditoria"
 
 # Capacidade padrão usada quando a Config ainda não tiver valor definido pelo ADM.
 CAPACIDADE_PADRAO_ONIBUS = 38
@@ -61,6 +63,7 @@ if not LOGGER.handlers:
 LOGGER.setLevel(logging.INFO)
 
 HISTORICO_MARGEM_LINHAS = 1000
+AUDITORIA_MARGEM_LINHAS = 1000
 TROCA_CICLO_COOLDOWN_ERRO = 20.0
 TROCA_CICLO_TEMPO_MAXIMO = 90.0
 LOCK_MUTACAO_TIMEOUT = 0.25
@@ -328,6 +331,38 @@ def ws_historico():
         return sheet_h
 
 
+@st.cache_resource
+def ws_auditoria():
+    """
+    Aba que registra exclusões de cadastros efetuadas pelo painel administrativo.
+    Ela é criada automaticamente no Google Sheets na primeira utilização.
+    """
+    doc = abrir_documento()
+
+    with lock_estrutura_planilhas():
+        try:
+            sheet_a = gs_call(doc.worksheet, WS_AUDITORIA)
+        except WorksheetNotFound:
+            # Confere novamente dentro do lock antes de criar, evitando duas abas
+            # quando dois acessos chegam quase ao mesmo tempo.
+            try:
+                sheet_a = gs_call(doc.worksheet, WS_AUDITORIA)
+            except WorksheetNotFound:
+                sheet_a = gs_call(
+                    doc.add_worksheet,
+                    title=WS_AUDITORIA,
+                    rows=str(AUDITORIA_MARGEM_LINHAS),
+                    cols=str(len(AUDITORIA_HEADERS))
+                )
+                gs_call(sheet_a.update, "A1", [AUDITORIA_HEADERS])
+
+        headers = [str(h).strip() for h in gs_call(sheet_a.row_values, 1)]
+        if headers[:len(AUDITORIA_HEADERS)] != AUDITORIA_HEADERS:
+            gs_call(sheet_a.update, "A1", [AUDITORIA_HEADERS])
+
+        return sheet_a
+
+
 # ==========================================================
 # SENHA TEMPORÁRIA (1 acesso) - RECUPERAÇÃO SEGURA
 # ==========================================================
@@ -338,6 +373,16 @@ HIST_HEADERS = [
     "CICLO_ID", "DATA_CICLO", "EMBARQUE", "ARQUIVADO_EM",
     "DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL",
     "CAPACIDADE_ONIBUS", PRIORIDADE_HEADER
+]
+
+# Cabeçalho da aba Auditoria, criada automaticamente no Google Sheets.
+# RESULTADO começa como PENDENTE e só muda para EXCLUIDO depois que o app
+# confirma que o cadastro realmente desapareceu da aba Usuarios.
+AUDITORIA_HEADERS = [
+    "ID_AUDITORIA", "DATA_HORA", "RESULTADO",
+    "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
+    "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
+    "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE", "USUARIO_STATUS"
 ]
 
 
@@ -855,6 +900,227 @@ def atualizar_dados_usuario_admin(
         lock.release()
 
 
+
+# ==========================================================
+# EXCLUSÃO DE CADASTRO COM AUDITORIA
+# ==========================================================
+def excluir_usuario_com_auditoria(
+    sheet_u,
+    email_usuario: str,
+    admin_tipo: str,
+    admin_nome: str,
+    admin_email: str,
+):
+    """
+    Exclui um cadastro somente depois de registrar a tentativa na aba Auditoria.
+
+    Fluxo de segurança:
+    1) relê o usuário diretamente da planilha pelo e-mail;
+    2) grava uma linha de auditoria com RESULTADO=PENDENTE;
+    3) confirma que o registro de auditoria existe;
+    4) exclui o cadastro;
+    5) confirma que o usuário realmente deixou de existir;
+    6) muda o RESULTADO para EXCLUIDO.
+
+    Se a exclusão falhar depois da criação do registro, a auditoria permanece
+    marcada como FALHA_NA_EXCLUSAO, preservando a rastreabilidade da tentativa.
+    """
+    email_norm = str(email_usuario or "").strip().lower()
+    if not email_norm:
+        return False, "EMAIL_INVALIDO"
+
+    lock, adquirido = adquirir_lock_mutacao()
+    if not adquirido:
+        return False, "SISTEMA_OCUPADO"
+
+    sheet_a = None
+    linha_auditoria = None
+    audit_id = uuid.uuid4().hex.upper()
+
+    try:
+        status_coord, _ = coordenador_troca_ciclo().obter_status()
+        if status_coord == "EM_ANDAMENTO":
+            return False, "TROCA_EM_ANDAMENTO"
+
+        dados_u = gs_call(
+            sheet_u.get_all_values,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        if not dados_u or len(dados_u) < 2:
+            return False, "USUARIO_NAO_ENCONTRADO"
+
+        headers = [str(h).strip() for h in dados_u[0]]
+        headers_upper = [h.upper() for h in headers]
+
+        def localizar_coluna(*candidatos):
+            for candidato in candidatos:
+                candidato_upper = str(candidato).upper()
+                if candidato_upper in headers_upper:
+                    return headers_upper.index(candidato_upper)
+            return None
+
+        col_email = localizar_coluna("EMAIL")
+        if col_email is None:
+            return False, "COLUNA_EMAIL_NAO_ENCONTRADA"
+
+        linhas_usuario = []
+        valores_usuario = None
+        for numero_linha, row in enumerate(dados_u[1:], start=2):
+            r = list(row) + [""] * (len(headers) - len(row))
+            if str(r[col_email]).strip().lower() == email_norm:
+                linhas_usuario.append(numero_linha)
+                if valores_usuario is None:
+                    valores_usuario = r
+
+        if not linhas_usuario or valores_usuario is None:
+            return False, "USUARIO_NAO_ENCONTRADO"
+
+        def valor_usuario(*candidatos):
+            indice = localizar_coluna(*candidatos)
+            if indice is None or indice >= len(valores_usuario):
+                return ""
+            return str(valores_usuario[indice] or "").strip()
+
+        usuario_graduacao = valor_usuario("GRADUAÇÃO", "GRADUACAO")
+        usuario_nome = valor_usuario("NOME")
+        usuario_lotacao = valor_usuario("LOTAÇÃO", "LOTACAO")
+        usuario_origem = valor_usuario("QG_RMCF_OUTROS", "ORIGEM")
+        usuario_email = valor_usuario("EMAIL") or email_norm
+        usuario_telefone = valor_usuario("TELEFONE", "TELEFONE")
+        usuario_status = valor_usuario("STATUS")
+
+        # A auditoria é criada antes da exclusão. Assim, nunca há exclusão
+        # intencional sem ao menos um registro PENDENTE/FALHA no histórico.
+        sheet_a = ws_auditoria()
+        data_hora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+        linha_registro = [
+            audit_id,
+            data_hora,
+            "PENDENTE",
+            str(admin_tipo or "").strip(),
+            str(admin_nome or "").strip(),
+            str(admin_email or "").strip(),
+            usuario_graduacao,
+            usuario_nome,
+            usuario_lotacao,
+            usuario_origem,
+            usuario_email,
+            usuario_telefone,
+            usuario_status,
+        ]
+
+        gs_call(
+            sheet_a.append_row,
+            linha_registro,
+            value_input_option="USER_ENTERED",
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+
+        celula_id = gs_call(
+            sheet_a.find,
+            audit_id,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        if celula_id is None:
+            raise RuntimeError("A criação do registro de auditoria não foi confirmada.")
+        linha_auditoria = int(celula_id.row)
+
+        # Confere o ID e o e-mail antes de autorizar a exclusão.
+        confirmacao_auditoria = gs_call(
+            sheet_a.row_values,
+            linha_auditoria,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        confirmacao_auditoria = list(confirmacao_auditoria) + [""] * len(AUDITORIA_HEADERS)
+        if (
+            str(confirmacao_auditoria[0]).strip() != audit_id
+            or str(confirmacao_auditoria[10]).strip().lower() != email_norm
+        ):
+            raise RuntimeError("Os dados do registro de auditoria não foram confirmados.")
+
+        # Exclui de baixo para cima. Em caso de duplicidade antiga do mesmo
+        # e-mail, todas as linhas são removidas sem deslocar as ainda pendentes.
+        for linha_usuario in reversed(linhas_usuario):
+            gs_call(
+                sheet_u.delete_rows,
+                linha_usuario,
+                _max_tries=3,
+                _max_sleep=1.5
+            )
+
+        # Confirma por nova leitura direta que o usuário realmente foi excluído.
+        dados_confirmacao = gs_call(
+            sheet_u.get_all_values,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        if dados_confirmacao:
+            headers_conf = [str(h).strip().upper() for h in dados_confirmacao[0]]
+            if "EMAIL" in headers_conf:
+                email_conf_idx = headers_conf.index("EMAIL")
+                ainda_existe = any(
+                    len(row) > email_conf_idx
+                    and str(row[email_conf_idx]).strip().lower() == email_norm
+                    for row in dados_confirmacao[1:]
+                )
+                if ainda_existe:
+                    raise RuntimeError("A exclusão do cadastro não foi confirmada na aba Usuarios.")
+
+        # RESULTADO é a coluna C.
+        gs_call(
+            sheet_a.update_cell,
+            linha_auditoria,
+            3,
+            "EXCLUIDO",
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+
+        resultado_confirmado = gs_call(
+            sheet_a.cell,
+            linha_auditoria,
+            3,
+            _max_tries=2,
+            _max_sleep=1.0
+        ).value
+        if str(resultado_confirmado or "").strip().upper() != "EXCLUIDO":
+            raise RuntimeError("A conclusão do registro de auditoria não foi confirmada.")
+
+        buscar_usuarios_admin.clear()
+        buscar_usuarios_cadastrados.clear()
+        buscar_auditoria_dados.clear()
+        return True, "EXCLUIDO"
+
+    except Exception:
+        LOGGER.exception("Falha ao excluir cadastro com auditoria.")
+
+        if sheet_a is not None and linha_auditoria is not None:
+            try:
+                gs_call(
+                    sheet_a.update_cell,
+                    linha_auditoria,
+                    3,
+                    "FALHA_NA_EXCLUSAO",
+                    _max_tries=2,
+                    _max_sleep=1.0
+                )
+            except Exception:
+                LOGGER.exception("Não foi possível marcar a falha na aba Auditoria.")
+
+        try:
+            buscar_auditoria_dados.clear()
+        except Exception:
+            pass
+        return False, "ERRO_EXCLUSAO"
+
+    finally:
+        lock.release()
+
+
 # ==========================================================
 # LEITURAS (CACHE_DATA)
 # ==========================================================
@@ -872,6 +1138,13 @@ def buscar_usuarios_admin():
     """Uso específico do ADM: mais fresco."""
     sheet_u = ws_usuarios()
     return gs_call(sheet_u.get_all_records)
+
+
+@st.cache_data(ttl=5)
+def buscar_auditoria_dados():
+    """Leitura fresca da trilha de auditoria de exclusões de cadastros."""
+    sheet_a = ws_auditoria()
+    return gs_call(sheet_a.get_all_records)
 
 def garantir_config_capacidade(sheet_c):
     """
@@ -2091,6 +2364,12 @@ if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 if "_admin_master" not in st.session_state:
     st.session_state._admin_master = False
+if "is_auditoria" not in st.session_state:
+    st.session_state.is_auditoria = False
+if "_auditoria_first_load" not in st.session_state:
+    st.session_state._auditoria_first_load = False
+if "_confirmar_exclusao_usuario_email" not in st.session_state:
+    st.session_state._confirmar_exclusao_usuario_email = ""
 
 # (antes era _force_password_change; agora existe o novo fluxo de atualização completa)
 if "_force_profile_update" not in st.session_state:
@@ -2147,8 +2426,12 @@ try:
     # =========================================
     # LOGIN / CADASTRO / INSTRUÇÕES / RECUPERAR / ADM
     # =========================================
-    if st.session_state.usuario_logado is None and not st.session_state.is_admin:
-        t1, t2, t3, t4, t5 = st.tabs(["Login", "Cadastro", "Instruções", "Recuperar", "ADM"])
+    if (
+        st.session_state.usuario_logado is None
+        and not st.session_state.is_admin
+        and not st.session_state.is_auditoria
+    ):
+        t1, t2, t3, t4, t5, t6 = st.tabs(["Login", "Cadastro", "Instruções", "Recuperar", "ADM", "Auditoria"])
 
         with t1:
             with st.form("form_login"):
@@ -2405,6 +2688,26 @@ try:
                         else:
                             st.error("ADM inválido ou sem permissão de acesso ao painel.")
 
+
+        with t6:
+            st.markdown("### 🧾 Auditoria de exclusões")
+            st.caption("Acesso exclusivo do Administrador Mestre.")
+            with st.form("form_auditoria_master"):
+                aud_u = st.text_input("Usuário do Administrador Mestre:")
+                aud_s = st.text_input("Senha do Administrador Mestre:", type="password")
+                entrou_auditoria = st.form_submit_button(
+                    "🔎 ACESSAR AUDITORIA",
+                    use_container_width=True
+                )
+
+                if entrou_auditoria:
+                    if str(aud_u or "").strip() == "123" and str(aud_s or "") == "123":
+                        st.session_state.is_auditoria = True
+                        st.session_state._auditoria_first_load = True
+                        st.rerun()
+                    else:
+                        st.error("Acesso negado. A Auditoria é exclusiva do Administrador Mestre.")
+
     # =========================================
     # PAINEL ADM
     # =========================================
@@ -2460,6 +2763,30 @@ try:
             st.success("Acesso ADM mestre: todas as permissões liberadas, inclusive conceder/remover acesso ADM.")
         else:
             st.info("Acesso ADM autorizado: painel liberado, exceto conceder/remover acesso ADM de usuários.")
+
+        # Identidade utilizada nos registros da aba Auditoria.
+        if is_admin_master:
+            admin_tipo_auditoria = "MESTRE"
+            admin_nome_auditoria = "ADMINISTRADOR MESTRE"
+            admin_email_auditoria = "MASTER"
+        else:
+            admin_email_auditoria = str(
+                st.session_state.get("_admin_user_email", "") or ""
+            ).strip().lower() or "NAO_IDENTIFICADO"
+            registro_admin_atual = next(
+                (
+                    u for u in records_u
+                    if str(u.get("Email", "") or "").strip().lower()
+                    == admin_email_auditoria
+                ),
+                None
+            )
+            admin_tipo_auditoria = "LOCAL"
+            admin_nome_auditoria = str(
+                (registro_admin_atual or {}).get("Nome", "")
+                or (registro_admin_atual or {}).get("NOME", "")
+                or "ADMINISTRADOR LOCAL"
+            ).strip()
 
         st.subheader("⚙️ Configurações Globais")
         c_cfg1, c_cfg2 = st.columns([1, 1])
@@ -2569,12 +2896,82 @@ try:
                             buscar_usuarios_cadastrados.clear()
                             st.rerun()
 
-                    del_btn = c5.button("🗑️", key=f"del_{i}")
+                    del_btn = c5.button(
+                        "🗑️",
+                        key=f"del_{i}",
+                        help="Solicitar exclusão deste cadastro"
+                    )
+                    email_user_norm = str(email_user or "").strip().lower()
+
                     if del_btn:
-                        gs_call(sheet_u_escrita.delete_rows, i + 2)
-                        buscar_usuarios_admin.clear()
-                        buscar_usuarios_cadastrados.clear()
-                        st.rerun()
+                        # O primeiro clique apenas abre a confirmação. Nenhuma
+                        # exclusão é feita neste momento.
+                        st.session_state._confirmar_exclusao_usuario_email = email_user_norm
+
+                    if (
+                        st.session_state.get("_confirmar_exclusao_usuario_email", "")
+                        == email_user_norm
+                    ):
+                        st.warning(
+                            f"⚠️ Tem certeza de que deseja excluir definitivamente o cadastro de "
+                            f"**{grad_user} {nome_user}** ({email_user})?"
+                        )
+                        st.caption(
+                            "A operação será registrada na Auditoria com o usuário excluído, "
+                            "o administrador responsável e a data/hora."
+                        )
+                        c_confirmar_del, c_cancelar_del = st.columns([1, 1])
+
+                        confirmar_del = c_confirmar_del.button(
+                            "✅ SIM, EXCLUIR CADASTRO",
+                            key=f"confirm_del_{i}",
+                            type="primary",
+                            use_container_width=True
+                        )
+                        cancelar_del = c_cancelar_del.button(
+                            "↩️ CANCELAR",
+                            key=f"cancel_del_{i}",
+                            use_container_width=True
+                        )
+
+                        if cancelar_del:
+                            st.session_state._confirmar_exclusao_usuario_email = ""
+                            st.rerun()
+
+                        if confirmar_del:
+                            excluiu_cadastro, status_exclusao_cadastro = excluir_usuario_com_auditoria(
+                                sheet_u_escrita,
+                                email_user_norm,
+                                admin_tipo_auditoria,
+                                admin_nome_auditoria,
+                                admin_email_auditoria,
+                            )
+                            st.session_state._confirmar_exclusao_usuario_email = ""
+
+                            if excluiu_cadastro:
+                                st.session_state._adm_flash = (
+                                    "success",
+                                    f"✅ Cadastro de {grad_user} {nome_user} excluído com sucesso. "
+                                    "A operação foi registrada na Auditoria."
+                                )
+                                st.rerun()
+                            elif status_exclusao_cadastro in {
+                                "SISTEMA_OCUPADO",
+                                "TROCA_EM_ANDAMENTO",
+                            }:
+                                st.warning(
+                                    "O sistema está concluindo outra operação ou uma troca de ciclo. "
+                                    "Aguarde alguns segundos e tente novamente."
+                                )
+                            elif status_exclusao_cadastro == "USUARIO_NAO_ENCONTRADO":
+                                st.warning(
+                                    "O cadastro não foi localizado. Atualize a relação de usuários."
+                                )
+                            else:
+                                st.error(
+                                    "Não foi possível concluir a exclusão com segurança. "
+                                    "Consulte a Auditoria e tente novamente."
+                                )
 
                     # Tanto o ADM mestre quanto o ADM autorizado podem alterar
                     # Graduação, Nome, Lotação e Origem do usuário.
@@ -2713,6 +3110,111 @@ try:
                                         "Não foi possível atualizar os dados do usuário agora. "
                                         "Tente novamente."
                                     )
+
+    # =========================================
+    # PAINEL DE AUDITORIA - SOMENTE ADM MESTRE
+    # =========================================
+    elif st.session_state.is_auditoria:
+        st.header("🧾 AUDITORIA DE EXCLUSÕES 🧾")
+        st.caption(
+            "Histórico de exclusões de cadastros. O acesso a esta tela é exclusivo "
+            "do Administrador Mestre."
+        )
+
+        c_sair_aud, c_atualizar_aud = st.columns([1, 1])
+        with c_sair_aud:
+            sair_auditoria = st.button(
+                "⬅️ SAIR DA AUDITORIA",
+                use_container_width=True
+            )
+        with c_atualizar_aud:
+            atualizar_auditoria = st.button(
+                "🔄 ATUALIZAR AUDITORIA",
+                use_container_width=True
+            )
+
+        if sair_auditoria:
+            st.session_state.is_auditoria = False
+            st.session_state._auditoria_first_load = False
+            st.rerun()
+
+        if st.session_state._auditoria_first_load or atualizar_auditoria:
+            buscar_auditoria_dados.clear()
+            st.session_state._auditoria_first_load = False
+            if atualizar_auditoria:
+                st.rerun()
+
+        registros_auditoria = buscar_auditoria_dados()
+        if not registros_auditoria:
+            st.info(
+                "Ainda não há exclusões registradas. A aba Auditoria do Google Sheets "
+                "será preenchida automaticamente na primeira exclusão confirmada."
+            )
+        else:
+            df_aud = pd.DataFrame(registros_auditoria)
+            for coluna in AUDITORIA_HEADERS:
+                if coluna not in df_aud.columns:
+                    df_aud[coluna] = ""
+
+            # Mais recentes primeiro.
+            df_aud["_DATA_ORDENACAO"] = pd.to_datetime(
+                df_aud["DATA_HORA"],
+                dayfirst=True,
+                errors="coerce"
+            )
+            df_aud = df_aud.sort_values(
+                by="_DATA_ORDENACAO",
+                ascending=False,
+                na_position="last"
+            ).drop(columns=["_DATA_ORDENACAO"], errors="ignore")
+
+            busca_auditoria = st.text_input(
+                "🔍 Pesquisar por usuário, e-mail ou administrador:"
+            ).strip().lower()
+            if busca_auditoria:
+                colunas_pesquisa = [
+                    "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
+                    "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
+                    "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE",
+                    "RESULTADO"
+                ]
+                mascara = pd.Series(False, index=df_aud.index)
+                for coluna in colunas_pesquisa:
+                    mascara = mascara | df_aud[coluna].astype(str).str.lower().str.contains(
+                        busca_auditoria,
+                        na=False,
+                        regex=False
+                    )
+                df_aud = df_aud[mascara]
+
+            st.metric("Registros encontrados", len(df_aud))
+
+            colunas_grid = [
+                "DATA_HORA", "RESULTADO",
+                "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
+                "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE",
+                "USUARIO_STATUS", "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL"
+            ]
+            df_grid = df_aud[colunas_grid].rename(columns={
+                "DATA_HORA": "Data/Hora",
+                "RESULTADO": "Resultado",
+                "USUARIO_GRADUACAO": "Graduação",
+                "USUARIO_NOME": "Usuário excluído",
+                "USUARIO_LOTACAO": "Lotação",
+                "USUARIO_ORIGEM": "Origem",
+                "USUARIO_EMAIL": "E-mail do usuário",
+                "USUARIO_TELEFONE": "Telefone",
+                "USUARIO_STATUS": "Status anterior",
+                "ADMIN_TIPO": "Tipo de ADM",
+                "ADMIN_NOME": "Administrador responsável",
+                "ADMIN_EMAIL": "E-mail do administrador",
+            })
+
+            st.dataframe(
+                df_grid,
+                use_container_width=True,
+                hide_index=True
+            )
 
     # =========================================
     # USUÁRIO LOGADO
