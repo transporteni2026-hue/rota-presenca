@@ -36,7 +36,11 @@ PRIORIDADE_HEADER = "PRIORIDADE_LISTA"
 # O acesso mestre @/@ continua existindo e é o único que pode alterar esta permissão.
 ADMIN_HEADER = "ACESSO_ADM"
 
-# Valores permitidos para o campo de origem dos usuários.
+# Valores permitidos nos campos editáveis do cadastro dos usuários.
+GRADUACOES_VALIDAS = [
+    "TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN",
+    "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"
+]
 ORIGENS_VALIDAS = ["QG", "RMCF", "OUTROS"]
 
 FUSO_BR = pytz.timezone("America/Sao_Paulo")
@@ -619,19 +623,37 @@ def find_user_row_by_email_tel(sheet_u, email: str, tel_digits: str):
     return None, None
 
 
-def atualizar_origem_usuario_admin(sheet_u, sheet_p, email: str, nova_origem: str):
+def atualizar_dados_usuario_admin(
+    sheet_u,
+    sheet_p,
+    email: str,
+    nova_graduacao: str,
+    novo_nome: str,
+    nova_lotacao: str,
+    nova_origem: str,
+):
     """
-    Altera a origem do usuário na aba Usuarios e, se ele já estiver inscrito
-    no ciclo atual, sincroniza também a coluna de origem da lista de presença.
+    Permite que o ADM mestre ou autorizado altere Graduação, Nome, Lotação e
+    Origem do usuário na aba Usuarios.
 
-    A operação usa o mesmo lock das mutações de presença para não disputar
-    com inscrição, exclusão ou troca automática de ciclo.
+    Se o usuário já estiver inscrito no ciclo atual, os mesmos dados também são
+    sincronizados na lista de presença para que a exibição, a ordenação e o PDF
+    sejam atualizados imediatamente.
     """
     email_norm = str(email or "").strip().lower()
+    graduacao_norm = str(nova_graduacao or "").strip().upper()
+    nome_norm = str(novo_nome or "").strip()
+    lotacao_norm = str(nova_lotacao or "").strip()
     origem_norm = str(nova_origem or "").strip().upper()
 
     if not email_norm:
         return False, "EMAIL_INVALIDO", 0
+    if graduacao_norm not in GRADUACOES_VALIDAS:
+        return False, "GRADUACAO_INVALIDA", 0
+    if not nome_norm:
+        return False, "NOME_INVALIDO", 0
+    if not lotacao_norm:
+        return False, "LOTACAO_INVALIDA", 0
     if origem_norm not in ORIGENS_VALIDAS:
         return False, "ORIGEM_INVALIDA", 0
 
@@ -639,9 +661,10 @@ def atualizar_origem_usuario_admin(sheet_u, sheet_p, email: str, nova_origem: st
     if not adquirido:
         return False, "SISTEMA_OCUPADO", 0
 
-    usuario_atualizado = False
+    linha_usuario = None
+    colunas_u = {}
+    valores_anteriores_u = {}
     presencas_atualizadas = []
-    origem_anterior_usuario = ""
 
     try:
         status_coord, _ = coordenador_troca_ciclo().obter_status()
@@ -659,44 +682,66 @@ def atualizar_origem_usuario_admin(sheet_u, sheet_p, email: str, nova_origem: st
         headers_u = [str(h).strip() for h in dados_u[0]]
         headers_u_upper = [h.upper() for h in headers_u]
 
-        try:
-            email_col_zero = headers_u_upper.index("EMAIL")
-        except ValueError:
+        def localizar_coluna(*candidatos):
+            for candidato in candidatos:
+                candidato_upper = str(candidato).upper()
+                if candidato_upper in headers_u_upper:
+                    return headers_u_upper.index(candidato_upper)
+            return None
+
+        email_col_zero = localizar_coluna("EMAIL")
+        colunas_u = {
+            "GRADUACAO": localizar_coluna("GRADUAÇÃO", "GRADUACAO"),
+            "NOME": localizar_coluna("NOME"),
+            "LOTACAO": localizar_coluna("LOTAÇÃO", "LOTACAO"),
+            "ORIGEM": localizar_coluna("QG_RMCF_OUTROS", "ORIGEM"),
+        }
+
+        if email_col_zero is None:
             return False, "COLUNA_EMAIL_NAO_ENCONTRADA", 0
+        if any(indice is None for indice in colunas_u.values()):
+            return False, "COLUNAS_CADASTRO_NAO_ENCONTRADAS", 0
 
-        origem_col_zero = None
-        for candidato in ("QG_RMCF_OUTROS", "ORIGEM"):
-            if candidato in headers_u_upper:
-                origem_col_zero = headers_u_upper.index(candidato)
-                break
-
-        if origem_col_zero is None:
-            return False, "COLUNA_ORIGEM_NAO_ENCONTRADA", 0
-
-        linha_usuario = None
+        linha_encontrada = None
+        linha_valores = None
         for idx, row in enumerate(dados_u[1:], start=2):
             r = list(row) + [""] * (len(headers_u) - len(row))
             if str(r[email_col_zero]).strip().lower() == email_norm:
-                linha_usuario = idx
-                origem_anterior_usuario = str(r[origem_col_zero] or "").strip().upper()
+                linha_encontrada = idx
+                linha_valores = r
                 break
 
-        if linha_usuario is None:
+        if linha_encontrada is None or linha_valores is None:
             return False, "USUARIO_NAO_ENCONTRADO", 0
 
-        # Atualiza o cadastro principal do usuário.
-        gs_call(
-            sheet_u.update_cell,
-            linha_usuario,
-            origem_col_zero + 1,
-            origem_norm,
-            _max_tries=3,
-            _max_sleep=1.5
-        )
-        usuario_atualizado = True
+        linha_usuario = linha_encontrada
+        novos_valores_u = {
+            "GRADUACAO": graduacao_norm,
+            "NOME": nome_norm,
+            "LOTACAO": lotacao_norm,
+            "ORIGEM": origem_norm,
+        }
+        valores_anteriores_u = {
+            campo: str(linha_valores[coluna] or "").strip()
+            for campo, coluna in colunas_u.items()
+        }
 
-        # Se o usuário estiver na lista atual, altera também a origem ali para
-        # que a ordenação seja recalculada imediatamente após o rerun.
+        # Atualiza somente os campos efetivamente modificados.
+        for campo, novo_valor in novos_valores_u.items():
+            valor_anterior = valores_anteriores_u[campo]
+            comparacao_anterior = valor_anterior.upper() if campo in {"GRADUACAO", "ORIGEM"} else valor_anterior
+            comparacao_nova = novo_valor.upper() if campo in {"GRADUACAO", "ORIGEM"} else novo_valor
+            if comparacao_anterior != comparacao_nova:
+                gs_call(
+                    sheet_u.update_cell,
+                    linha_usuario,
+                    colunas_u[campo] + 1,
+                    novo_valor,
+                    _max_tries=3,
+                    _max_sleep=1.5
+                )
+
+        # Sincroniza B:E da lista atual: Origem, Graduação, Nome e Lotação.
         dados_p = gs_call(
             sheet_p.get_all_values,
             _max_tries=2,
@@ -706,30 +751,49 @@ def atualizar_origem_usuario_admin(sheet_u, sheet_p, email: str, nova_origem: st
         for numero_linha, row in enumerate((dados_p or [])[1:], start=2):
             r = list(row) + [""] * 6
             if str(r[5]).strip().lower() == email_norm:
-                origem_anterior_presenca = str(r[1] or "").strip().upper()
-                gs_call(
-                    sheet_p.update_cell,
-                    numero_linha,
-                    2,
+                valores_anteriores_presenca = [
+                    str(r[1] or "").strip(),
+                    str(r[2] or "").strip(),
+                    str(r[3] or "").strip(),
+                    str(r[4] or "").strip(),
+                ]
+                novos_valores_presenca = [
                     origem_norm,
-                    _max_tries=2,
-                    _max_sleep=1.0
-                )
-                presencas_atualizadas.append((numero_linha, origem_anterior_presenca))
+                    graduacao_norm,
+                    nome_norm,
+                    lotacao_norm,
+                ]
 
-        # Confirma a gravação no cadastro.
-        origem_confirmada = str(
-            gs_call(
-                sheet_u.cell,
-                linha_usuario,
-                origem_col_zero + 1,
-                _max_tries=2,
-                _max_sleep=1.0
-            ).value or ""
-        ).strip().upper()
+                if valores_anteriores_presenca != novos_valores_presenca:
+                    gs_call(
+                        sheet_p.update,
+                        f"B{numero_linha}:E{numero_linha}",
+                        [novos_valores_presenca],
+                        value_input_option="USER_ENTERED",
+                        _max_tries=2,
+                        _max_sleep=1.0
+                    )
+                    presencas_atualizadas.append((numero_linha, valores_anteriores_presenca))
 
-        if origem_confirmada != origem_norm:
-            raise RuntimeError("A atualização da origem não foi confirmada na aba Usuarios.")
+        # Confirma todos os campos no cadastro do usuário.
+        dados_confirmacao_u = gs_call(
+            sheet_u.row_values,
+            linha_usuario,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        dados_confirmacao_u = list(dados_confirmacao_u) + [""] * (
+            len(headers_u) - len(dados_confirmacao_u)
+        )
+
+        for campo, novo_valor in novos_valores_u.items():
+            valor_confirmado = str(dados_confirmacao_u[colunas_u[campo]] or "").strip()
+            if campo in {"GRADUACAO", "ORIGEM"}:
+                confirmado_ok = valor_confirmado.upper() == novo_valor.upper()
+            else:
+                confirmado_ok = valor_confirmado == novo_valor
+            if not confirmado_ok:
+                raise RuntimeError(f"A atualização do campo {campo} não foi confirmada na aba Usuarios.")
 
         # Confirma também as linhas eventualmente alteradas na presença atual.
         if presencas_atualizadas:
@@ -738,59 +802,49 @@ def atualizar_origem_usuario_admin(sheet_u, sheet_p, email: str, nova_origem: st
                 _max_tries=2,
                 _max_sleep=1.0
             )
+            esperados_presenca = [origem_norm, graduacao_norm, nome_norm, lotacao_norm]
             for row in (dados_p_confirmacao or [])[1:]:
                 r = list(row) + [""] * 6
                 if str(r[5]).strip().lower() == email_norm:
-                    if str(r[1] or "").strip().upper() != origem_norm:
-                        raise RuntimeError("A origem não foi confirmada na lista de presença atual.")
+                    confirmados_presenca = [str(r[pos] or "").strip() for pos in range(1, 5)]
+                    if confirmados_presenca != esperados_presenca:
+                        raise RuntimeError("Os novos dados não foram confirmados na lista de presença atual.")
 
         buscar_usuarios_admin.clear()
         buscar_usuarios_cadastrados.clear()
         buscar_presenca_atualizada.clear()
 
-        return True, "ATUALIZADA", len(presencas_atualizadas)
+        return True, "ATUALIZADOS", len(presencas_atualizadas)
 
     except Exception:
-        LOGGER.exception("Falha ao alterar a origem do usuário pelo painel ADM.")
+        LOGGER.exception("Falha ao alterar os dados do usuário pelo painel ADM.")
 
-        # Tenta desfazer a operação caso alguma etapa posterior tenha falhado,
-        # evitando deixar cadastro e lista atual com origens diferentes.
-        if usuario_atualizado:
-            try:
-                dados_u_rollback = gs_call(sheet_u.get_all_values, _max_tries=1)
-                headers_rb = [str(h).strip().upper() for h in dados_u_rollback[0]] if dados_u_rollback else []
-                email_idx_rb = headers_rb.index("EMAIL") if "EMAIL" in headers_rb else None
-                origem_idx_rb = None
-                for candidato in ("QG_RMCF_OUTROS", "ORIGEM"):
-                    if candidato in headers_rb:
-                        origem_idx_rb = headers_rb.index(candidato)
-                        break
-                if email_idx_rb is not None and origem_idx_rb is not None:
-                    for idx, row in enumerate(dados_u_rollback[1:], start=2):
-                        r = list(row) + [""] * (len(headers_rb) - len(row))
-                        if str(r[email_idx_rb]).strip().lower() == email_norm:
-                            gs_call(
-                                sheet_u.update_cell,
-                                idx,
-                                origem_idx_rb + 1,
-                                origem_anterior_usuario,
-                                _max_tries=1
-                            )
-                            break
-            except Exception:
-                LOGGER.exception("Não foi possível reverter a origem na aba Usuarios.")
+        # Tenta restaurar o cadastro caso uma etapa posterior tenha falhado.
+        if linha_usuario is not None and colunas_u and valores_anteriores_u:
+            for campo, valor_anterior in valores_anteriores_u.items():
+                try:
+                    gs_call(
+                        sheet_u.update_cell,
+                        linha_usuario,
+                        colunas_u[campo] + 1,
+                        valor_anterior,
+                        _max_tries=1
+                    )
+                except Exception:
+                    LOGGER.exception("Não foi possível reverter o campo %s na aba Usuarios.", campo)
 
-        for numero_linha, origem_anterior in presencas_atualizadas:
+        # Restaura as linhas da lista atual que já haviam sido alteradas.
+        for numero_linha, valores_anteriores in presencas_atualizadas:
             try:
                 gs_call(
-                    sheet_p.update_cell,
-                    numero_linha,
-                    2,
-                    origem_anterior,
+                    sheet_p.update,
+                    f"B{numero_linha}:E{numero_linha}",
+                    [valores_anteriores],
+                    value_input_option="USER_ENTERED",
                     _max_tries=1
                 )
             except Exception:
-                LOGGER.exception("Não foi possível reverter a origem na lista de presença.")
+                LOGGER.exception("Não foi possível reverter os dados na lista de presença.")
 
         buscar_usuarios_admin.clear()
         buscar_usuarios_cadastrados.clear()
@@ -2181,8 +2235,7 @@ try:
                     fmt_tel_cad = tel_format_br(raw_tel_cad)
                     st.session_state._tel_cad_fmt = fmt_tel_cad
 
-                    n_g = st.selectbox("Graduação:", ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT",
-                                                      "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"])
+                    n_g = st.selectbox("Graduação:", GRADUACOES_VALIDAS)
                     n_l = st.text_input("Lotação:")
                     n_o = st.selectbox("Origem:", ["QG", "RMCF", "OUTROS"])
                     n_p = st.text_input("Senha:", type="password")
@@ -2468,7 +2521,7 @@ try:
             orig_user = str(user.get("QG_RMCF_OUTROS", "") or user.get("ORIGEM", "") or "").strip()
 
             # A pesquisa continua buscando por nome/e-mail e também passa a encontrar por lotação/origem.
-            texto_busca_user = f"{nome_user} {email_user} {lot_user} {orig_user}".lower()
+            texto_busca_user = f"{grad_user} {nome_user} {email_user} {lot_user} {orig_user}".lower()
 
             if busca == "" or busca in texto_busca_user:
                 status = str(user.get("STATUS", "")).upper()
@@ -2524,58 +2577,142 @@ try:
                         st.rerun()
 
                     # Tanto o ADM mestre quanto o ADM autorizado podem alterar
-                    # a origem do usuário entre QG, RMCF e OUTROS.
+                    # Graduação, Nome, Lotação e Origem do usuário.
+                    graduacao_planilha = str(grad_user or "").strip().upper()
+                    graduacao_para_select = (
+                        graduacao_planilha
+                        if graduacao_planilha in GRADUACOES_VALIDAS
+                        else "SD"
+                    )
+                    graduacao_index = GRADUACOES_VALIDAS.index(graduacao_para_select)
+
                     origem_planilha = str(orig_user or "").strip().upper()
-                    origem_para_select = origem_planilha if origem_planilha in ORIGENS_VALIDAS else "QG"
+                    origem_para_select = (
+                        origem_planilha
+                        if origem_planilha in ORIGENS_VALIDAS
+                        else "QG"
+                    )
                     origem_index = ORIGENS_VALIDAS.index(origem_para_select)
 
-                    c_origem, c_salvar_origem = st.columns([3, 1])
-                    nova_origem_adm = c_origem.selectbox(
-                        "Origem do usuário:",
-                        ORIGENS_VALIDAS,
-                        index=origem_index,
-                        key=f"adm_origem_{i}"
-                    )
-                    c_salvar_origem.write("")
-                    salvar_origem_btn = c_salvar_origem.button(
-                        "💾 SALVAR",
-                        key=f"adm_salvar_origem_{i}",
-                        use_container_width=True
-                    )
+                    st.markdown("**✏️ Alterar dados cadastrais**")
+                    with st.form(f"adm_editar_dados_{i}"):
+                        c_grad, c_origem = st.columns([1, 1])
+                        nova_graduacao_adm = c_grad.selectbox(
+                            "Graduação:",
+                            GRADUACOES_VALIDAS,
+                            index=graduacao_index
+                        )
+                        nova_origem_adm = c_origem.selectbox(
+                            "Origem:",
+                            ORIGENS_VALIDAS,
+                            index=origem_index
+                        )
 
-                    if salvar_origem_btn:
-                        if nova_origem_adm == origem_planilha:
-                            st.info(f"A origem de {nome_user} já está definida como {nova_origem_adm}.")
+                        novo_nome_adm = st.text_input(
+                            "Nome de Escala:",
+                            value=nome_user
+                        )
+                        nova_lotacao_adm = st.text_input(
+                            "Lotação:",
+                            value=lot_user
+                        )
+
+                        salvar_dados_btn = st.form_submit_button(
+                            "💾 SALVAR DADOS DO USUÁRIO",
+                            use_container_width=True
+                        )
+
+                    if salvar_dados_btn:
+                        graduacao_nova_norm = str(nova_graduacao_adm or "").strip().upper()
+                        nome_novo_norm = str(novo_nome_adm or "").strip()
+                        lotacao_nova_norm = str(nova_lotacao_adm or "").strip()
+                        origem_nova_norm = str(nova_origem_adm or "").strip().upper()
+
+                        campos_invalidos = []
+                        if graduacao_nova_norm not in GRADUACOES_VALIDAS:
+                            campos_invalidos.append("Graduação")
+                        if not nome_novo_norm:
+                            campos_invalidos.append("Nome de Escala")
+                        if not lotacao_nova_norm:
+                            campos_invalidos.append("Lotação")
+                        if origem_nova_norm not in ORIGENS_VALIDAS:
+                            campos_invalidos.append("Origem")
+
+                        if campos_invalidos:
+                            st.error(
+                                "Preencha corretamente: "
+                                + ", ".join(campos_invalidos)
+                                + "."
+                            )
                         else:
-                            alterou, status_origem, qtd_presencas = atualizar_origem_usuario_admin(
-                                sheet_u_escrita,
-                                ws_presenca(),
-                                email_user,
-                                nova_origem_adm
+                            dados_anteriores = (
+                                graduacao_planilha,
+                                str(nome_user or "").strip(),
+                                str(lot_user or "").strip(),
+                                origem_planilha,
+                            )
+                            dados_novos = (
+                                graduacao_nova_norm,
+                                nome_novo_norm,
+                                lotacao_nova_norm,
+                                origem_nova_norm,
                             )
 
-                            if alterou:
-                                complemento = (
-                                    " A lista de presença atual também foi sincronizada."
-                                    if qtd_presencas > 0
-                                    else ""
-                                )
-                                st.session_state._adm_flash = (
-                                    "success",
-                                    f"✅ Origem de {grad_user} {nome_user} alterada para {nova_origem_adm}.{complemento}"
-                                )
-                                st.rerun()
-                            elif status_origem in {"SISTEMA_OCUPADO", "TROCA_EM_ANDAMENTO"}:
-                                st.warning(
-                                    "O sistema está concluindo outra operação ou uma troca de ciclo. "
-                                    "Aguarde alguns segundos e tente salvar novamente."
-                                )
-                            elif status_origem == "USUARIO_NAO_ENCONTRADO":
-                                st.error("O usuário não foi localizado na planilha. Atualize a relação e tente novamente.")
-                            elif status_origem == "COLUNA_ORIGEM_NAO_ENCONTRADA":
-                                st.error("A coluna QG_RMCF_OUTROS/ORIGEM não foi localizada na aba Usuarios.")
+                            if dados_novos == dados_anteriores:
+                                st.info("Nenhuma alteração foi identificada nos dados deste usuário.")
                             else:
-                                st.error("Não foi possível alterar a origem do usuário agora. Tente novamente.")
+                                alterou, status_dados, qtd_presencas = atualizar_dados_usuario_admin(
+                                    sheet_u_escrita,
+                                    ws_presenca(),
+                                    email_user,
+                                    graduacao_nova_norm,
+                                    nome_novo_norm,
+                                    lotacao_nova_norm,
+                                    origem_nova_norm,
+                                )
+
+                                if alterou:
+                                    complemento = (
+                                        " A lista de presença atual também foi sincronizada."
+                                        if qtd_presencas > 0
+                                        else ""
+                                    )
+                                    st.session_state._adm_flash = (
+                                        "success",
+                                        f"✅ Dados de {graduacao_nova_norm} {nome_novo_norm} atualizados com sucesso.{complemento}"
+                                    )
+                                    st.rerun()
+                                elif status_dados in {"SISTEMA_OCUPADO", "TROCA_EM_ANDAMENTO"}:
+                                    st.warning(
+                                        "O sistema está concluindo outra operação ou uma troca de ciclo. "
+                                        "Aguarde alguns segundos e tente salvar novamente."
+                                    )
+                                elif status_dados == "USUARIO_NAO_ENCONTRADO":
+                                    st.error(
+                                        "O usuário não foi localizado na planilha. "
+                                        "Atualize a relação e tente novamente."
+                                    )
+                                elif status_dados in {
+                                    "COLUNA_EMAIL_NAO_ENCONTRADA",
+                                    "COLUNAS_CADASTRO_NAO_ENCONTRADAS",
+                                }:
+                                    st.error(
+                                        "Uma ou mais colunas do cadastro não foram localizadas na aba Usuarios. "
+                                        "Verifique os cabeçalhos Nome, Graduação, Lotação, QG_RMCF_OUTROS/ORIGEM e Email."
+                                    )
+                                elif status_dados == "GRADUACAO_INVALIDA":
+                                    st.error("A graduação selecionada não é válida.")
+                                elif status_dados == "NOME_INVALIDO":
+                                    st.error("O Nome de Escala não pode ficar vazio.")
+                                elif status_dados == "LOTACAO_INVALIDA":
+                                    st.error("A Lotação não pode ficar vazia.")
+                                elif status_dados == "ORIGEM_INVALIDA":
+                                    st.error("A origem selecionada não é válida.")
+                                else:
+                                    st.error(
+                                        "Não foi possível atualizar os dados do usuário agora. "
+                                        "Tente novamente."
+                                    )
 
     # =========================================
     # USUÁRIO LOGADO
@@ -2605,8 +2742,8 @@ try:
             orig_atual = str(u.get("QG_RMCF_OUTROS", "") or u.get("ORIGEM", "") or "QG")
             tel_atual_fmt = tel_format_br(str(u.get("TELEFONE", "") or ""))
 
-            grads = ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"]
-            origs = ["QG", "RMCF", "OUTROS"]
+            grads = GRADUACOES_VALIDAS
+            origs = ORIGENS_VALIDAS
 
             try:
                 grad_idx = grads.index(str(grad_atual).strip()) if str(grad_atual).strip() in grads else grads.index("SD")
