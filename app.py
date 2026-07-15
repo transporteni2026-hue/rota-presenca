@@ -375,6 +375,10 @@ def ws_auditoria():
         if headers[:len(AUDITORIA_HEADERS)] != AUDITORIA_HEADERS:
             gs_call(sheet_a.update, "A1", [AUDITORIA_HEADERS])
 
+        # A aba pode ter colunas excedentes de versões anteriores. Elas não são
+        # apagadas para evitar perda de dados antigos. A rotina de leitura usa
+        # somente AUDITORIA_HEADERS e, portanto, não falha caso essas colunas
+        # adicionais estejam sem título.
         return sheet_a
 
 
@@ -1913,9 +1917,40 @@ def buscar_usuarios_admin():
 
 @st.cache_data(ttl=5)
 def buscar_auditoria_dados():
-    """Leitura fresca da trilha de auditoria de eventos cadastrais."""
+    """
+    Lê a trilha de auditoria sem depender de ``get_all_records()``.
+
+    O gspread rejeita planilhas que tenham duas ou mais colunas sem título na
+    primeira linha, mesmo quando essas colunas estão fora da estrutura usada
+    pelo aplicativo. Isso pode acontecer quando a aba Auditoria já possuía uma
+    grade mais larga ou dados residuais de uma versão anterior.
+
+    A leitura abaixo usa somente as colunas oficiais de AUDITORIA_HEADERS,
+    ignora colunas excedentes e mantém compatibilidade com registros antigos.
+    """
     sheet_a = ws_auditoria()
-    return gs_call(sheet_a.get_all_records)
+    valores = gs_call(sheet_a.get_all_values)
+
+    if not valores or len(valores) < 2:
+        return []
+
+    quantidade_colunas = len(AUDITORIA_HEADERS)
+    registros = []
+
+    for linha in valores[1:]:
+        linha_normalizada = list(linha[:quantidade_colunas])
+        if len(linha_normalizada) < quantidade_colunas:
+            linha_normalizada.extend(
+                [""] * (quantidade_colunas - len(linha_normalizada))
+            )
+
+        # Ignora linhas completamente vazias dentro da grade da planilha.
+        if not any(str(valor or "").strip() for valor in linha_normalizada):
+            continue
+
+        registros.append(dict(zip(AUDITORIA_HEADERS, linha_normalizada)))
+
+    return registros
 
 def garantir_config_capacidade(sheet_c):
     """
