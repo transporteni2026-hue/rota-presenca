@@ -404,7 +404,11 @@ AUDITORIA_HEADERS = [
     "DADOS_USUARIO_JSON",
     "RESTAURACAO_RESULTADO", "RESTAURADO_EM",
     "RESTAURADO_POR_TIPO", "RESTAURADO_POR_NOME", "RESTAURADO_POR_EMAIL",
-    "RESTAURACAO_OBSERVACAO"
+    "RESTAURACAO_OBSERVACAO",
+    # Campos genéricos usados também para auditar alterações realizadas pelo
+    # próprio usuário após login com senha temporária.
+    "TIPO_EVENTO", "CAMPOS_ALTERADOS", "DETALHES_ALTERACOES",
+    "DADOS_ANTES_JSON", "DADOS_DEPOIS_JSON"
 ]
 
 
@@ -1049,6 +1053,11 @@ def excluir_usuario_com_auditoria(
             "",  # RESTAURADO_POR_NOME
             "",  # RESTAURADO_POR_EMAIL
             "",  # RESTAURACAO_OBSERVACAO
+            "EXCLUSAO_CADASTRO",  # TIPO_EVENTO
+            "",  # CAMPOS_ALTERADOS
+            "",  # DETALHES_ALTERACOES
+            "",  # DADOS_ANTES_JSON
+            "",  # DADOS_DEPOIS_JSON
         ]
 
         gs_call(
@@ -1449,6 +1458,432 @@ def restaurar_usuario_da_auditoria(
         lock.release()
 
 
+
+# ==========================================================
+# ALTERAÇÃO DE CADASTRO COM SENHA TEMPORÁRIA + AUDITORIA
+# ==========================================================
+def atualizar_cadastro_temp_com_auditoria(
+    sheet_u,
+    usuario_atual: dict,
+    novo_nome: str,
+    nova_graduacao: str,
+    nova_lotacao: str,
+    nova_senha: str,
+    nova_origem: str,
+    novo_telefone: str,
+):
+    """
+    Atualiza o cadastro após login com senha temporária e registra a operação.
+
+    A auditoria é criada como PENDENTE antes da alteração. Depois que os dados
+    são confirmados diretamente na aba Usuarios, o resultado muda para
+    ALTERACAO_CONFIRMADA. A senha nunca é gravada na Auditoria; apenas fica
+    registrado que o campo Senha foi alterado.
+    """
+    email_norm = str((usuario_atual or {}).get("Email", "") or "").strip().lower()
+    if not email_norm:
+        return False, "EMAIL_INVALIDO", ""
+
+    novo_nome = str(novo_nome or "").strip()
+    nova_graduacao = str(nova_graduacao or "").strip().upper()
+    nova_lotacao = str(nova_lotacao or "").strip()
+    nova_senha = str(nova_senha or "")
+    nova_origem = str(nova_origem or "").strip().upper()
+    novo_telefone = tel_format_br(novo_telefone)
+
+    if not novo_nome:
+        return False, "NOME_INVALIDO", ""
+    if nova_graduacao not in GRADUACOES_VALIDAS:
+        return False, "GRADUACAO_INVALIDA", ""
+    if not nova_lotacao:
+        return False, "LOTACAO_INVALIDA", ""
+    if nova_origem not in ORIGENS_VALIDAS:
+        return False, "ORIGEM_INVALIDA", ""
+    if not tel_is_valid_11(novo_telefone):
+        return False, "TELEFONE_INVALIDO", ""
+    if not nova_senha:
+        return False, "SENHA_INVALIDA", ""
+
+    lock, adquirido = adquirir_lock_mutacao()
+    if not adquirido:
+        return False, "SISTEMA_OCUPADO", ""
+
+    sheet_a = None
+    linha_auditoria = None
+    audit_id = uuid.uuid4().hex.upper()
+    alteracao_confirmada = False
+    valores_para_reverter = {}
+    temp_anteriores = {}
+
+    try:
+        status_coord, _ = coordenador_troca_ciclo().obter_status()
+        if status_coord == "EM_ANDAMENTO":
+            return False, "TROCA_EM_ANDAMENTO", ""
+
+        # Garante as colunas do token antes de obter a linha completa atual.
+        temp_cols = ensure_temp_cols(sheet_u)
+        dados_u = gs_call(
+            sheet_u.get_all_values,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        if not dados_u or len(dados_u) < 2:
+            return False, "USUARIO_NAO_ENCONTRADO", ""
+
+        headers = [str(h).strip() for h in dados_u[0]]
+        headers_upper = [h.upper() for h in headers]
+
+        def localizar_coluna(*candidatos):
+            for candidato in candidatos:
+                candidato_upper = str(candidato or "").strip().upper()
+                if candidato_upper in headers_upper:
+                    return headers_upper.index(candidato_upper)
+            return None
+
+        indices = {
+            "Nome de Escala": localizar_coluna("NOME"),
+            "Graduação": localizar_coluna("GRADUAÇÃO", "GRADUACAO"),
+            "Lotação": localizar_coluna("LOTAÇÃO", "LOTACAO"),
+            "Senha": localizar_coluna("SENHA"),
+            "Origem": localizar_coluna("QG_RMCF_OUTROS", "ORIGEM"),
+            "E-mail": localizar_coluna("EMAIL"),
+            "Telefone": localizar_coluna("TELEFONE"),
+            "Status": localizar_coluna("STATUS"),
+        }
+        obrigatorios = [
+            "Nome de Escala", "Graduação", "Lotação", "Senha",
+            "Origem", "E-mail", "Telefone"
+        ]
+        if any(indices[campo] is None for campo in obrigatorios):
+            return False, "COLUNAS_CADASTRO_NAO_ENCONTRADAS", ""
+
+        linha_usuario = None
+        valores_usuario = None
+        col_email = indices["E-mail"]
+        for numero_linha, row in enumerate(dados_u[1:], start=2):
+            r = list(row) + [""] * (len(headers) - len(row))
+            if str(r[col_email]).strip().lower() == email_norm:
+                linha_usuario = numero_linha
+                valores_usuario = r
+                break
+
+        if linha_usuario is None or valores_usuario is None:
+            return False, "USUARIO_NAO_ENCONTRADO", ""
+
+        # Confere novamente a unicidade do telefone dentro da região protegida.
+        tel_novo_digits = tel_only_digits(novo_telefone)
+        col_tel = indices["Telefone"]
+        for numero_linha, row in enumerate(dados_u[1:], start=2):
+            if numero_linha == linha_usuario:
+                continue
+            r = list(row) + [""] * (len(headers) - len(row))
+            if tel_only_digits(r[col_tel]) == tel_novo_digits:
+                return False, "TELEFONE_JA_CADASTRADO", ""
+
+        valores_novos = {
+            "Nome de Escala": novo_nome,
+            "Graduação": nova_graduacao,
+            "Lotação": nova_lotacao,
+            "Senha": nova_senha,
+            "Origem": nova_origem,
+            "Telefone": novo_telefone,
+        }
+        valores_anteriores = {
+            campo: str(valores_usuario[indice] or "")
+            for campo, indice in indices.items()
+            if indice is not None and campo in valores_novos
+        }
+
+        def diferente(campo, anterior, novo):
+            if campo == "Telefone":
+                return tel_only_digits(anterior) != tel_only_digits(novo)
+            if campo in {"Graduação", "Origem"}:
+                return str(anterior or "").strip().upper() != str(novo or "").strip().upper()
+            if campo == "Senha":
+                return str(anterior or "") != str(novo or "")
+            return str(anterior or "").strip() != str(novo or "").strip()
+
+        campos_alterados = [
+            campo for campo in valores_novos
+            if diferente(campo, valores_anteriores.get(campo, ""), valores_novos[campo])
+        ]
+
+        detalhes = []
+        for campo in campos_alterados:
+            if campo == "Senha":
+                detalhes.append("Senha: alterada (conteúdo não armazenado)")
+            else:
+                anterior = valores_anteriores.get(campo, "")
+                novo = valores_novos[campo]
+                detalhes.append(f"{campo}: '{anterior}' → '{novo}'")
+
+        if not detalhes:
+            detalhes.append(
+                "Nenhum dado cadastral foi modificado; somente o fluxo de recuperação "
+                "por senha temporária foi concluído."
+            )
+
+        campos_texto = ", ".join(campos_alterados) if campos_alterados else "NENHUM"
+        detalhes_texto = " | ".join(detalhes)
+
+        status_idx = indices.get("Status")
+        usuario_status = (
+            str(valores_usuario[status_idx] or "").strip()
+            if status_idx is not None
+            else str((usuario_atual or {}).get("STATUS", "") or "").strip()
+        )
+
+        snapshot_antes = {
+            "Nome de Escala": valores_anteriores.get("Nome de Escala", ""),
+            "Graduação": valores_anteriores.get("Graduação", ""),
+            "Lotação": valores_anteriores.get("Lotação", ""),
+            "Origem": valores_anteriores.get("Origem", ""),
+            "Telefone": tel_format_br(valores_anteriores.get("Telefone", "")),
+            "Senha_alterada": "Senha" in campos_alterados,
+        }
+        snapshot_depois = {
+            "Nome de Escala": novo_nome,
+            "Graduação": nova_graduacao,
+            "Lotação": nova_lotacao,
+            "Origem": nova_origem,
+            "Telefone": novo_telefone,
+            "Senha_alterada": "Senha" in campos_alterados,
+        }
+
+        # Registra a intenção antes de modificar o cadastro, garantindo trilha
+        # inclusive quando uma falha ocorrer no meio da operação.
+        sheet_a = ws_auditoria()
+        data_hora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+        linha_dict = {header: "" for header in AUDITORIA_HEADERS}
+        linha_dict.update({
+            "ID_AUDITORIA": audit_id,
+            "DATA_HORA": data_hora,
+            "RESULTADO": "PENDENTE",
+            "ADMIN_TIPO": "USUARIO",
+            "ADMIN_NOME": novo_nome or valores_anteriores.get("Nome de Escala", ""),
+            "ADMIN_EMAIL": email_norm,
+            "USUARIO_GRADUACAO": nova_graduacao,
+            "USUARIO_NOME": novo_nome,
+            "USUARIO_LOTACAO": nova_lotacao,
+            "USUARIO_ORIGEM": nova_origem,
+            "USUARIO_EMAIL": email_norm,
+            "USUARIO_TELEFONE": novo_telefone,
+            "USUARIO_STATUS": usuario_status,
+            "TIPO_EVENTO": "ALTERACAO_CADASTRO_SENHA_TEMP",
+            "CAMPOS_ALTERADOS": campos_texto,
+            "DETALHES_ALTERACOES": detalhes_texto,
+            "DADOS_ANTES_JSON": json.dumps(
+                snapshot_antes, ensure_ascii=False, separators=(",", ":")
+            ),
+            "DADOS_DEPOIS_JSON": json.dumps(
+                snapshot_depois, ensure_ascii=False, separators=(",", ":")
+            ),
+        })
+        linha_registro = [linha_dict[header] for header in AUDITORIA_HEADERS]
+
+        gs_call(
+            sheet_a.append_row,
+            linha_registro,
+            value_input_option="USER_ENTERED",
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        celula_id = gs_call(
+            sheet_a.find,
+            audit_id,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        if celula_id is None:
+            raise RuntimeError("A criação do registro de auditoria não foi confirmada.")
+        linha_auditoria = int(celula_id.row)
+
+        headers_a = [str(h).strip() for h in gs_call(sheet_a.row_values, 1)]
+        colunas_a = {h: i + 1 for i, h in enumerate(headers_a)}
+        confirmacao_a = gs_call(
+            sheet_a.row_values,
+            linha_auditoria,
+            _max_tries=2,
+            _max_sleep=1.0
+        )
+        confirmacao_a = list(confirmacao_a) + [""] * len(headers_a)
+        registro_conf = {
+            headers_a[i]: (confirmacao_a[i] if i < len(confirmacao_a) else "")
+            for i in range(len(headers_a))
+        }
+        if (
+            str(registro_conf.get("ID_AUDITORIA", "")).strip() != audit_id
+            or str(registro_conf.get("USUARIO_EMAIL", "")).strip().lower() != email_norm
+            or str(registro_conf.get("TIPO_EVENTO", "")).strip().upper()
+            != "ALTERACAO_CADASTRO_SENHA_TEMP"
+        ):
+            raise RuntimeError("Os dados da auditoria da alteração não foram confirmados.")
+
+        # Guarda os valores para eventual reversão se a alteração não for
+        # confirmada integralmente na aba Usuarios.
+        for campo, novo_valor in valores_novos.items():
+            indice_zero = indices[campo]
+            valores_para_reverter[indice_zero + 1] = valores_usuario[indice_zero]
+
+        for nome_temp, coluna_temp in temp_cols.items():
+            indice_zero = coluna_temp - 1
+            temp_anteriores[coluna_temp] = (
+                valores_usuario[indice_zero] if indice_zero < len(valores_usuario) else ""
+            )
+
+        # Atualiza os campos cadastrais pelo cabeçalho, sem depender de posição
+        # fixa das colunas na planilha.
+        for campo, novo_valor in valores_novos.items():
+            gs_call(
+                sheet_u.update_cell,
+                linha_usuario,
+                indices[campo] + 1,
+                novo_valor,
+                _max_tries=2,
+                _max_sleep=1.0
+            )
+
+        # Invalida a senha temporária depois de gravar a nova senha real.
+        gs_call(sheet_u.update_cell, linha_usuario, temp_cols["TEMP_SENHA"], "", _max_tries=2)
+        gs_call(sheet_u.update_cell, linha_usuario, temp_cols["TEMP_EXPIRA"], "", _max_tries=2)
+        gs_call(sheet_u.update_cell, linha_usuario, temp_cols["TEMP_USADA"], "SIM", _max_tries=2)
+
+        # Confirma diretamente na planilha todos os valores salvos e o consumo
+        # do token temporário antes de finalizar a Auditoria.
+        linha_confirmacao = gs_call(
+            sheet_u.row_values,
+            linha_usuario,
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        linha_confirmacao = list(linha_confirmacao) + [""] * len(headers)
+        for campo, esperado in valores_novos.items():
+            obtido = linha_confirmacao[indices[campo]]
+            if campo == "Telefone":
+                confere = tel_only_digits(obtido) == tel_only_digits(esperado)
+            elif campo in {"Graduação", "Origem"}:
+                confere = str(obtido or "").strip().upper() == str(esperado or "").strip().upper()
+            elif campo == "Senha":
+                confere = str(obtido or "") == str(esperado or "")
+            else:
+                confere = str(obtido or "").strip() == str(esperado or "").strip()
+            if not confere:
+                raise RuntimeError(f"O campo {campo} não foi confirmado na aba Usuarios.")
+
+        if (
+            str(linha_confirmacao[temp_cols["TEMP_SENHA"] - 1] or "").strip()
+            or str(linha_confirmacao[temp_cols["TEMP_EXPIRA"] - 1] or "").strip()
+            or str(linha_confirmacao[temp_cols["TEMP_USADA"] - 1] or "").strip().upper() != "SIM"
+        ):
+            raise RuntimeError("A invalidação da senha temporária não foi confirmada.")
+
+        alteracao_confirmada = True
+        resultado_col = colunas_a.get("RESULTADO", 3)
+        gs_call(
+            sheet_a.update_cell,
+            linha_auditoria,
+            resultado_col,
+            "ALTERACAO_CONFIRMADA",
+            _max_tries=3,
+            _max_sleep=1.5
+        )
+        resultado_final = gs_call(
+            sheet_a.cell,
+            linha_auditoria,
+            resultado_col,
+            _max_tries=2,
+            _max_sleep=1.0
+        ).value
+        if str(resultado_final or "").strip().upper() != "ALTERACAO_CONFIRMADA":
+            raise RuntimeError("A conclusão da alteração não foi confirmada na Auditoria.")
+
+        buscar_usuarios_cadastrados.clear()
+        buscar_usuarios_admin.clear()
+        buscar_auditoria_dados.clear()
+        return True, "ALTERACAO_CONFIRMADA", campos_texto
+
+    except Exception as exc:
+        LOGGER.exception("Falha ao atualizar cadastro temporário com auditoria.")
+
+        # Se os novos dados ainda não foram confirmados, tenta restaurar os
+        # valores anteriores para evitar cadastro parcialmente atualizado.
+        if not alteracao_confirmada:
+            for coluna, valor_anterior in valores_para_reverter.items():
+                try:
+                    gs_call(
+                        sheet_u.update_cell,
+                        linha_usuario,
+                        coluna,
+                        valor_anterior,
+                        _max_tries=1
+                    )
+                except Exception:
+                    LOGGER.exception("Não foi possível reverter um campo do cadastro.")
+            for coluna, valor_anterior in temp_anteriores.items():
+                try:
+                    gs_call(
+                        sheet_u.update_cell,
+                        linha_usuario,
+                        coluna,
+                        valor_anterior,
+                        _max_tries=1
+                    )
+                except Exception:
+                    LOGGER.exception("Não foi possível reverter um campo de senha temporária.")
+
+        if sheet_a is not None and linha_auditoria is not None:
+            try:
+                headers_a = [str(h).strip() for h in gs_call(sheet_a.row_values, 1)]
+                colunas_a = {h: i + 1 for i, h in enumerate(headers_a)}
+                resultado_falha = (
+                    "ALTERACAO_CONFIRMADA_AUDITORIA_PENDENTE"
+                    if alteracao_confirmada
+                    else "FALHA_NA_ALTERACAO"
+                )
+                gs_call(
+                    sheet_a.update_cell,
+                    linha_auditoria,
+                    colunas_a.get("RESULTADO", 3),
+                    resultado_falha,
+                    _max_tries=2,
+                    _max_sleep=1.0
+                )
+                if "DETALHES_ALTERACOES" in colunas_a:
+                    atual = gs_call(
+                        sheet_a.cell,
+                        linha_auditoria,
+                        colunas_a["DETALHES_ALTERACOES"],
+                        _max_tries=1
+                    ).value
+                    observacao = (
+                        f"{str(atual or '').strip()} | Falha técnica: "
+                        f"{type(exc).__name__}: {exc}"
+                    )[:1500]
+                    gs_call(
+                        sheet_a.update_cell,
+                        linha_auditoria,
+                        colunas_a["DETALHES_ALTERACOES"],
+                        observacao,
+                        _max_tries=1
+                    )
+            except Exception:
+                LOGGER.exception("Não foi possível atualizar o resultado da auditoria.")
+
+        buscar_usuarios_cadastrados.clear()
+        buscar_usuarios_admin.clear()
+        try:
+            buscar_auditoria_dados.clear()
+        except Exception:
+            pass
+
+        if alteracao_confirmada:
+            return True, "ALTERACAO_CONFIRMADA_AUDITORIA_PENDENTE", ""
+        return False, "ERRO_ATUALIZACAO", ""
+
+    finally:
+        lock.release()
+
+
 # ==========================================================
 # LEITURAS (CACHE_DATA)
 # ==========================================================
@@ -1470,7 +1905,7 @@ def buscar_usuarios_admin():
 
 @st.cache_data(ttl=5)
 def buscar_auditoria_dados():
-    """Leitura fresca da trilha de auditoria de exclusões de cadastros."""
+    """Leitura fresca da trilha de auditoria de eventos cadastrais."""
     sheet_a = ws_auditoria()
     return gs_call(sheet_a.get_all_records)
 
@@ -2900,7 +3335,7 @@ try:
                         if not n_n_ok: missing.append("Nome de Escala")
                         if not n_e_ok: missing.append("E-mail")
                         if not email_ok and n_e_ok: missing.append("E-mail (formato inválido)")
-                        if not tel_is_valid_11(fmt_tel_cad): missing.append("Telefone (Use DDD + 9 dígitos / ex: 21987654321)")
+                        if not tel_is_valid_11(fmt_tel_cad): missing.append("Telefone (inválido)")
                         if not n_g_ok: missing.append("Graduação")
                         if not n_l_ok: missing.append("Lotação")
                         if not n_o_ok: missing.append("Origem")
@@ -3480,10 +3915,11 @@ try:
     # PAINEL DE AUDITORIA - SOMENTE ADM MESTRE
     # =========================================
     elif st.session_state.is_auditoria:
-        st.header("🧾 AUDITORIA DE EXCLUSÕES 🧾")
+        st.header("🧾 AUDITORIA DE CADASTROS 🧾")
         st.caption(
-            "Histórico de exclusões e restaurações de cadastros. O acesso a esta tela "
-            "é exclusivo do Administrador Mestre."
+            "Histórico de exclusões, restaurações e alterações realizadas pelo próprio "
+            "usuário após login com senha temporária. O acesso é exclusivo do "
+            "Administrador Mestre."
         )
 
         auditoria_flash = st.session_state.get("_auditoria_flash")
@@ -3524,8 +3960,8 @@ try:
         registros_auditoria = buscar_auditoria_dados()
         if not registros_auditoria:
             st.info(
-                "Ainda não há exclusões registradas. A aba Auditoria do Google Sheets "
-                "será preenchida automaticamente na primeira exclusão confirmada."
+                "Ainda não há eventos registrados. A aba Auditoria do Google Sheets será "
+                "preenchida automaticamente na primeira exclusão ou alteração auditável."
             )
         else:
             df_aud = pd.DataFrame(registros_auditoria)
@@ -3553,7 +3989,8 @@ try:
                     "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
                     "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
                     "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE",
-                    "RESULTADO", "RESTAURACAO_RESULTADO",
+                    "RESULTADO", "TIPO_EVENTO", "CAMPOS_ALTERADOS",
+                    "DETALHES_ALTERACOES", "RESTAURACAO_RESULTADO",
                     "RESTAURADO_POR_NOME", "RESTAURADO_POR_EMAIL"
                 ]
                 mascara = pd.Series(False, index=df_aud.index)
@@ -3565,29 +4002,58 @@ try:
                     )
                 df_aud = df_aud[mascara]
 
+            # Registros antigos de exclusão podem não possuir TIPO_EVENTO.
+            tipo_evento_norm = df_aud["TIPO_EVENTO"].astype(str).str.strip()
+            df_aud.loc[tipo_evento_norm.eq(""), "TIPO_EVENTO"] = "EXCLUSAO_CADASTRO"
+
+            tipos_evento = [
+                "TODOS",
+                "EXCLUSAO_CADASTRO",
+                "ALTERACAO_CADASTRO_SENHA_TEMP",
+            ]
+            filtro_evento = st.selectbox(
+                "Filtrar tipo de evento:",
+                tipos_evento,
+                format_func=lambda valor: {
+                    "TODOS": "Todos os eventos",
+                    "EXCLUSAO_CADASTRO": "Exclusões e restaurações",
+                    "ALTERACAO_CADASTRO_SENHA_TEMP": "Alterações com senha temporária",
+                }.get(valor, valor),
+                key="auditoria_filtro_evento"
+            )
+            if filtro_evento != "TODOS":
+                df_aud = df_aud[
+                    df_aud["TIPO_EVENTO"].astype(str).str.strip().str.upper()
+                    == filtro_evento
+                ]
+
             st.metric("Registros encontrados", len(df_aud))
 
             colunas_grid = [
-                "DATA_HORA", "RESULTADO",
+                "DATA_HORA", "TIPO_EVENTO", "RESULTADO",
                 "USUARIO_GRADUACAO", "USUARIO_NOME", "USUARIO_LOTACAO",
                 "USUARIO_ORIGEM", "USUARIO_EMAIL", "USUARIO_TELEFONE",
-                "USUARIO_STATUS", "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
+                "USUARIO_STATUS", "CAMPOS_ALTERADOS", "DETALHES_ALTERACOES",
+                "ADMIN_TIPO", "ADMIN_NOME", "ADMIN_EMAIL",
                 "RESTAURACAO_RESULTADO", "RESTAURADO_EM",
                 "RESTAURADO_POR_NOME", "RESTAURADO_POR_EMAIL"
             ]
             df_grid = df_aud[colunas_grid].rename(columns={
-                "DATA_HORA": "Excluído em",
-                "RESULTADO": "Resultado da exclusão",
+                "DATA_HORA": "Data/hora",
+                "TIPO_EVENTO": "Evento",
+                "RESULTADO": "Resultado",
                 "USUARIO_GRADUACAO": "Graduação",
-                "USUARIO_NOME": "Usuário excluído",
+                "USUARIO_NOME": "Usuário",
                 "USUARIO_LOTACAO": "Lotação",
                 "USUARIO_ORIGEM": "Origem",
                 "USUARIO_EMAIL": "E-mail do usuário",
                 "USUARIO_TELEFONE": "Telefone",
-                "USUARIO_STATUS": "Status anterior",
-                "ADMIN_TIPO": "Tipo de ADM",
-                "ADMIN_NOME": "Administrador que excluiu",
-                "ADMIN_EMAIL": "E-mail do administrador",
+                "USUARIO_STATUS": "Status",
+                "CAMPOS_ALTERADOS": "Campos alterados",
+                "DETALHES_ALTERACOES": "Detalhes das alterações",
+                "ADMIN_TIPO": "Tipo do responsável",
+                "ADMIN_NOME": "Responsável pelo evento",
+                "ADMIN_EMAIL": "E-mail do responsável",
                 "RESTAURACAO_RESULTADO": "Resultado da restauração",
                 "RESTAURADO_EM": "Restaurado em",
                 "RESTAURADO_POR_NOME": "Restaurado por",
@@ -3819,7 +4285,7 @@ try:
 
                 missing = []
                 if not n_ok: missing.append("Nome de Escala")
-                if not tel_is_valid_11(fmt_tel_up): missing.append("Telefone (Use DDD + 9 dígitos / ex: 21987654321)")
+                if not tel_is_valid_11(fmt_tel_up): missing.append("Telefone (inválido)")
                 if not norm_str(novo_grad): missing.append("Graduação")
                 if not l_ok: missing.append("Lotação")
                 if not norm_str(novo_orig): missing.append("Origem")
@@ -3852,38 +4318,73 @@ try:
                             if tel_colide:
                                 st.error("Este telefone já está cadastrado para outro usuário.")
                             else:
-                                # Atualiza colunas no layout do seu append_row:
-                                # 1 Nome | 2 Graduação | 3 Lotação | 4 Senha | 5 Origem | 6 Email | 7 Telefone | 8 STATUS
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 1, norm_str(novo_nome))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 2, norm_str(novo_grad))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 3, norm_str(novo_lot))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 4, norm_str(nova1))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 5, norm_str(novo_orig))
-                                gs_call(sheet_u_escrita.update_cell, row_idx, 7, fmt_tel_up)
+                                atualizou_temp, status_temp, campos_temp = (
+                                    atualizar_cadastro_temp_com_auditoria(
+                                        sheet_u_escrita,
+                                        u,
+                                        norm_str(novo_nome),
+                                        norm_str(novo_grad),
+                                        norm_str(novo_lot),
+                                        norm_str(nova1),
+                                        norm_str(novo_orig),
+                                        fmt_tel_up,
+                                    )
+                                )
 
-                                # Finaliza token TEMP: marca como usado e limpa
-                                temp_cols = ensure_temp_cols(sheet_u_escrita)
-                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_SENHA"], "")
-                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_EXPIRA"], "")
-                                gs_call(sheet_u_escrita.update_cell, row_idx, temp_cols["TEMP_USADA"], "SIM")
+                                if atualizou_temp:
+                                    # Atualiza a sessão local somente depois da
+                                    # confirmação direta no Google Sheets.
+                                    st.session_state.usuario_logado["Nome"] = norm_str(novo_nome)
+                                    st.session_state.usuario_logado["Graduação"] = norm_str(novo_grad)
+                                    st.session_state.usuario_logado["Lotação"] = norm_str(novo_lot)
+                                    st.session_state.usuario_logado["Senha"] = norm_str(nova1)
+                                    st.session_state.usuario_logado["QG_RMCF_OUTROS"] = norm_str(novo_orig)
+                                    st.session_state.usuario_logado["TELEFONE"] = fmt_tel_up
 
-                                buscar_usuarios_cadastrados.clear()
-                                buscar_usuarios_admin.clear()
+                                    st.session_state._force_profile_update = False
+                                    st.session_state._profile_update_row = None
+                                    st.session_state._login_kind = "REAL"
 
-                                # Atualiza sessão local
-                                st.session_state.usuario_logado["Nome"] = norm_str(novo_nome)
-                                st.session_state.usuario_logado["Graduação"] = norm_str(novo_grad)
-                                st.session_state.usuario_logado["Lotação"] = norm_str(novo_lot)
-                                st.session_state.usuario_logado["Senha"] = norm_str(nova1)
-                                st.session_state.usuario_logado["QG_RMCF_OUTROS"] = norm_str(novo_orig)
-                                st.session_state.usuario_logado["TELEFONE"] = fmt_tel_up
-
-                                st.session_state._force_profile_update = False
-                                st.session_state._profile_update_row = None
-                                st.session_state._login_kind = "REAL"
-
-                                st.success("✅ Cadastro atualizado. Você já pode usar o sistema normalmente.")
-                                st.rerun()
+                                    if status_temp == "ALTERACAO_CONFIRMADA_AUDITORIA_PENDENTE":
+                                        st.session_state._flash_operacao = (
+                                            "warning",
+                                            "Cadastro atualizado, mas a conclusão do registro de "
+                                            "Auditoria encontrou uma falha temporária. O registro "
+                                            "permaneceu salvo para conferência do Administrador Mestre."
+                                        )
+                                    else:
+                                        detalhe_campos = (
+                                            f" Campos alterados: {campos_temp}."
+                                            if campos_temp and campos_temp != "NENHUM"
+                                            else ""
+                                        )
+                                        st.session_state._flash_operacao = (
+                                            "success",
+                                            "✅ Cadastro atualizado e registrado na Auditoria." + detalhe_campos
+                                        )
+                                    st.rerun()
+                                elif status_temp in {"SISTEMA_OCUPADO", "TROCA_EM_ANDAMENTO"}:
+                                    st.warning(
+                                        "O sistema está concluindo outra operação. Aguarde alguns "
+                                        "segundos e tente salvar novamente."
+                                    )
+                                elif status_temp == "TELEFONE_JA_CADASTRADO":
+                                    st.error("Este telefone já está cadastrado para outro usuário.")
+                                elif status_temp == "USUARIO_NAO_ENCONTRADO":
+                                    st.error(
+                                        "Seu cadastro não foi localizado na planilha. Atualize a "
+                                        "página e tente novamente."
+                                    )
+                                elif status_temp == "COLUNAS_CADASTRO_NAO_ENCONTRADAS":
+                                    st.error(
+                                        "Uma ou mais colunas do cadastro não foram localizadas na "
+                                        "aba Usuarios."
+                                    )
+                                else:
+                                    st.error(
+                                        "Não foi possível atualizar o cadastro com segurança. "
+                                        "Nenhuma alteração parcial foi mantida. Tente novamente."
+                                    )
                     except Exception as ex:
                         st.error(f"Falha ao atualizar cadastro: {ex}")
 
