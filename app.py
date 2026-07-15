@@ -2721,6 +2721,10 @@ if "_tel_login_fmt" not in st.session_state:
     st.session_state._tel_login_fmt = ""
 if "_tel_cad_fmt" not in st.session_state:
     st.session_state._tel_cad_fmt = ""
+if "_cadastro_form_version" not in st.session_state:
+    st.session_state._cadastro_form_version = 0
+if "_cadastro_flash" not in st.session_state:
+    st.session_state._cadastro_flash = None
 
 # ==========================================================
 # NOVO (somente para confirmar exclusão da presença)
@@ -2839,10 +2843,21 @@ try:
                             st.error("Dados incorretos.")
 
         with t2:
+            # Exibe a confirmação após o rerun provocado pela gravação.
+            # A mensagem não exige qualquer botão e aparece junto do formulário já limpo.
+            cadastro_flash = st.session_state.get("_cadastro_flash")
+            if cadastro_flash:
+                st.success(cadastro_flash)
+                st.session_state._cadastro_flash = None
+
             if len(records_u_public) >= limite_max:
                 st.warning(f"⚠️ Limite de {limite_max} usuários atingido.")
             else:
-                with st.form("form_novo_cadastro"):
+                # A versão do formulário é alterada após cada cadastro concluído.
+                # Isso força o Streamlit a criar widgets novos e vazios, evitando
+                # que os dados do cadastro anterior permaneçam visíveis.
+                cadastro_form_version = int(st.session_state.get("_cadastro_form_version", 0))
+                with st.form(f"form_novo_cadastro_{cadastro_form_version}"):
                     n_n = st.text_input("Nome de Escala:")
                     n_e = st.text_input("E-mail:")
 
@@ -2850,9 +2865,17 @@ try:
                     fmt_tel_cad = tel_format_br(raw_tel_cad)
                     st.session_state._tel_cad_fmt = fmt_tel_cad
 
-                    n_g = st.selectbox("Graduação:", GRADUACOES_VALIDAS)
+                    n_g = st.selectbox(
+                        "Graduação:",
+                        [""] + GRADUACOES_VALIDAS,
+                        format_func=lambda valor: "Selecione..." if valor == "" else valor
+                    )
                     n_l = st.text_input("Lotação:")
-                    n_o = st.selectbox("Origem:", ["QG", "RMCF", "OUTROS"])
+                    n_o = st.selectbox(
+                        "Origem:",
+                        [""] + ORIGENS_VALIDAS,
+                        format_func=lambda valor: "Selecione..." if valor == "" else valor
+                    )
                     n_p = st.text_input("Senha:", type="password")
 
                     cadastrou = st.form_submit_button("✍️ SALVAR CADASTRO 👈", use_container_width=True)
@@ -2914,7 +2937,17 @@ try:
                                 ])
                                 buscar_usuarios_cadastrados.clear()
                                 buscar_usuarios_admin.clear()
-                                st.success("Cadastro realizado! Aguardando aprovação do Administrador.")
+
+                                # A confirmação é mostrada no próximo ciclo do Streamlit,
+                                # quando o formulário já estará completamente limpo.
+                                st.session_state._cadastro_flash = (
+                                    "✅ Cadastro salvo com sucesso! "
+                                    "Aguarde a aprovação do Administrador para acessar o sistema."
+                                )
+                                st.session_state._tel_cad_fmt = ""
+                                st.session_state._cadastro_form_version = (
+                                    int(st.session_state.get("_cadastro_form_version", 0)) + 1
+                                )
                                 st.rerun()
 
         with t3:
