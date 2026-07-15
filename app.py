@@ -1475,10 +1475,15 @@ def atualizar_cadastro_temp_com_auditoria(
     """
     Atualiza o cadastro após login com senha temporária e registra a operação.
 
-    A auditoria é criada como PENDENTE antes da alteração. Depois que os dados
+    A gravação na aba Usuarios é feita em uma única atualização de faixa com
+    value_input_option="RAW". Isso evita que o Google Sheets converta senhas
+    numéricas, telefones ou textos e reduz drasticamente a quantidade de
+    requisições, impedindo falhas e reversões por atualização parcial.
+
+    A Auditoria é criada como PENDENTE antes da alteração. Depois que os dados
     são confirmados diretamente na aba Usuarios, o resultado muda para
-    ALTERACAO_CONFIRMADA. A senha nunca é gravada na Auditoria; apenas fica
-    registrado que o campo Senha foi alterado.
+    ALTERACAO_CONFIRMADA. A senha nunca é gravada na Auditoria; registra-se
+    apenas que ela foi alterada.
     """
     email_norm = str((usuario_atual or {}).get("Email", "") or "").strip().lower()
     if not email_norm:
@@ -1503,6 +1508,8 @@ def atualizar_cadastro_temp_com_auditoria(
         return False, "TELEFONE_INVALIDO", ""
     if not nova_senha:
         return False, "SENHA_INVALIDA", ""
+    if nova_senha.isdigit() and nova_senha.startswith("0"):
+        return False, "SENHA_ZERO_INICIAL", ""
 
     lock, adquirido = adquirir_lock_mutacao()
     if not adquirido:
@@ -1512,24 +1519,27 @@ def atualizar_cadastro_temp_com_auditoria(
     linha_auditoria = None
     audit_id = uuid.uuid4().hex.upper()
     alteracao_confirmada = False
-    valores_para_reverter = {}
-    temp_anteriores = {}
+    usuario_escrito = False
+    linha_usuario = None
+    faixa_usuario = None
+    valores_faixa_anteriores = None
 
     try:
         status_coord, _ = coordenador_troca_ciclo().obter_status()
         if status_coord == "EM_ANDAMENTO":
             return False, "TROCA_EM_ANDAMENTO", ""
 
-        # Garante as colunas do token antes de obter a linha completa atual.
+        # Garante as colunas TEMP antes da leitura definitiva da linha.
         temp_cols = ensure_temp_cols(sheet_u)
         dados_u = gs_call(
             sheet_u.get_all_values,
-            _max_tries=3,
+            _max_tries=4,
             _max_sleep=1.5
         )
         if not dados_u or len(dados_u) < 2:
             return False, "USUARIO_NAO_ENCONTRADO", ""
 
+        # Preserva as posições reais, inclusive se houver alguma coluna vazia.
         headers = [str(h).strip() for h in dados_u[0]]
         headers_upper = [h.upper() for h in headers]
 
@@ -1554,14 +1564,19 @@ def atualizar_cadastro_temp_com_auditoria(
             "Nome de Escala", "Graduação", "Lotação", "Senha",
             "Origem", "E-mail", "Telefone"
         ]
-        if any(indices[campo] is None for campo in obrigatorios):
-            return False, "COLUNAS_CADASTRO_NAO_ENCONTRADAS", ""
+        faltantes = [campo for campo in obrigatorios if indices[campo] is None]
+        if faltantes:
+            return (
+                False,
+                "COLUNAS_CADASTRO_NAO_ENCONTRADAS",
+                ", ".join(faltantes)
+            )
 
-        linha_usuario = None
-        valores_usuario = None
         col_email = indices["E-mail"]
+        valores_usuario = None
         for numero_linha, row in enumerate(dados_u[1:], start=2):
             r = list(row) + [""] * (len(headers) - len(row))
+            r = r[:len(headers)]
             if str(r[col_email]).strip().lower() == email_norm:
                 linha_usuario = numero_linha
                 valores_usuario = r
@@ -1570,7 +1585,7 @@ def atualizar_cadastro_temp_com_auditoria(
         if linha_usuario is None or valores_usuario is None:
             return False, "USUARIO_NAO_ENCONTRADO", ""
 
-        # Confere novamente a unicidade do telefone dentro da região protegida.
+        # Confere a unicidade do telefone dentro da mesma região protegida.
         tel_novo_digits = tel_only_digits(novo_telefone)
         col_tel = indices["Telefone"]
         for numero_linha, row in enumerate(dados_u[1:], start=2):
@@ -1589,9 +1604,8 @@ def atualizar_cadastro_temp_com_auditoria(
             "Telefone": novo_telefone,
         }
         valores_anteriores = {
-            campo: str(valores_usuario[indice] or "")
-            for campo, indice in indices.items()
-            if indice is not None and campo in valores_novos
+            campo: str(valores_usuario[indices[campo]] or "")
+            for campo in valores_novos
         }
 
         def diferente(campo, anterior, novo):
@@ -1650,8 +1664,7 @@ def atualizar_cadastro_temp_com_auditoria(
             "Senha_alterada": "Senha" in campos_alterados,
         }
 
-        # Registra a intenção antes de modificar o cadastro, garantindo trilha
-        # inclusive quando uma falha ocorrer no meio da operação.
+        # 1) Registra a intenção antes de modificar o cadastro.
         sheet_a = ws_auditoria()
         data_hora = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
         linha_dict = {header: "" for header in AUDITORIA_HEADERS}
@@ -1684,79 +1697,76 @@ def atualizar_cadastro_temp_com_auditoria(
         gs_call(
             sheet_a.append_row,
             linha_registro,
-            value_input_option="USER_ENTERED",
+            value_input_option="RAW",
             _max_tries=3,
             _max_sleep=1.5
         )
         celula_id = gs_call(
             sheet_a.find,
             audit_id,
-            _max_tries=2,
+            _max_tries=3,
             _max_sleep=1.0
         )
         if celula_id is None:
-            raise RuntimeError("A criação do registro de auditoria não foi confirmada.")
+            raise RuntimeError("A criação do registro de Auditoria não foi confirmada.")
         linha_auditoria = int(celula_id.row)
+        colunas_a = {h: i + 1 for i, h in enumerate(AUDITORIA_HEADERS)}
 
-        headers_a = [str(h).strip() for h in gs_call(sheet_a.row_values, 1)]
-        colunas_a = {h: i + 1 for i, h in enumerate(headers_a)}
-        confirmacao_a = gs_call(
-            sheet_a.row_values,
-            linha_auditoria,
-            _max_tries=2,
-            _max_sleep=1.0
-        )
-        confirmacao_a = list(confirmacao_a) + [""] * len(headers_a)
-        registro_conf = {
-            headers_a[i]: (confirmacao_a[i] if i < len(confirmacao_a) else "")
-            for i in range(len(headers_a))
+        # 2) Monta uma única faixa contendo cadastro + token temporário.
+        atualizacoes_por_coluna = {
+            indices["Nome de Escala"] + 1: novo_nome,
+            indices["Graduação"] + 1: nova_graduacao,
+            indices["Lotação"] + 1: nova_lotacao,
+            indices["Senha"] + 1: nova_senha,
+            indices["Origem"] + 1: nova_origem,
+            indices["Telefone"] + 1: novo_telefone,
+            temp_cols["TEMP_SENHA"]: "",
+            temp_cols["TEMP_EXPIRA"]: "",
+            temp_cols["TEMP_USADA"]: "SIM",
         }
-        if (
-            str(registro_conf.get("ID_AUDITORIA", "")).strip() != audit_id
-            or str(registro_conf.get("USUARIO_EMAIL", "")).strip().lower() != email_norm
-            or str(registro_conf.get("TIPO_EVENTO", "")).strip().upper()
-            != "ALTERACAO_CADASTRO_SENHA_TEMP"
-        ):
-            raise RuntimeError("Os dados da auditoria da alteração não foram confirmados.")
+        primeira_coluna = min(atualizacoes_por_coluna)
+        ultima_coluna = max(atualizacoes_por_coluna)
 
-        # Guarda os valores para eventual reversão se a alteração não for
-        # confirmada integralmente na aba Usuarios.
-        for campo, novo_valor in valores_novos.items():
-            indice_zero = indices[campo]
-            valores_para_reverter[indice_zero + 1] = valores_usuario[indice_zero]
+        linha_completa_original = list(valores_usuario) + [""] * (
+            ultima_coluna - len(valores_usuario)
+        )
+        linha_completa_original = linha_completa_original[:ultima_coluna]
+        linha_completa_nova = list(linha_completa_original)
 
-        for nome_temp, coluna_temp in temp_cols.items():
-            indice_zero = coluna_temp - 1
-            temp_anteriores[coluna_temp] = (
-                valores_usuario[indice_zero] if indice_zero < len(valores_usuario) else ""
-            )
+        for coluna_um_based, valor in atualizacoes_por_coluna.items():
+            linha_completa_nova[coluna_um_based - 1] = valor
 
-        # Atualiza os campos cadastrais pelo cabeçalho, sem depender de posição
-        # fixa das colunas na planilha.
-        for campo, novo_valor in valores_novos.items():
-            gs_call(
-                sheet_u.update_cell,
-                linha_usuario,
-                indices[campo] + 1,
-                novo_valor,
-                _max_tries=2,
-                _max_sleep=1.0
-            )
+        inicio_a1 = gspread.utils.rowcol_to_a1(linha_usuario, primeira_coluna)
+        fim_a1 = gspread.utils.rowcol_to_a1(linha_usuario, ultima_coluna)
+        faixa_usuario = f"{inicio_a1}:{fim_a1}"
+        valores_faixa_anteriores = linha_completa_original[
+            primeira_coluna - 1:ultima_coluna
+        ]
+        valores_faixa_novos = linha_completa_nova[
+            primeira_coluna - 1:ultima_coluna
+        ]
 
-        # Invalida a senha temporária depois de gravar a nova senha real.
-        gs_call(sheet_u.update_cell, linha_usuario, temp_cols["TEMP_SENHA"], "", _max_tries=2)
-        gs_call(sheet_u.update_cell, linha_usuario, temp_cols["TEMP_EXPIRA"], "", _max_tries=2)
-        gs_call(sheet_u.update_cell, linha_usuario, temp_cols["TEMP_USADA"], "SIM", _max_tries=2)
+        # RAW é essencial: impede que uma senha como "1111" ou um texto com
+        # zeros seja convertido pelo Google Sheets durante a gravação.
+        gs_call(
+            sheet_u.update,
+            faixa_usuario,
+            [valores_faixa_novos],
+            value_input_option="RAW",
+            _max_tries=4,
+            _max_sleep=1.5
+        )
+        usuario_escrito = True
 
-        # Confirma diretamente na planilha todos os valores salvos e o consumo
-        # do token temporário antes de finalizar a Auditoria.
+        # 3) Confirma diretamente todos os campos em uma nova leitura.
         linha_confirmacao = gs_call(
             sheet_u.row_values,
             linha_usuario,
-            _max_tries=3,
+            _max_tries=4,
             _max_sleep=1.5
         )
-        linha_confirmacao = list(linha_confirmacao) + [""] * len(headers)
+        linha_confirmacao = list(linha_confirmacao) + [""] * ultima_coluna
+
         for campo, esperado in valores_novos.items():
             obtido = linha_confirmacao[indices[campo]]
             if campo == "Telefone":
@@ -1768,7 +1778,10 @@ def atualizar_cadastro_temp_com_auditoria(
             else:
                 confere = str(obtido or "").strip() == str(esperado or "").strip()
             if not confere:
-                raise RuntimeError(f"O campo {campo} não foi confirmado na aba Usuarios.")
+                raise RuntimeError(
+                    f"O campo {campo} não foi confirmado na aba Usuarios "
+                    f"(esperado={esperado!r}; obtido={obtido!r})."
+                )
 
         if (
             str(linha_confirmacao[temp_cols["TEMP_SENHA"] - 1] or "").strip()
@@ -1777,8 +1790,12 @@ def atualizar_cadastro_temp_com_auditoria(
         ):
             raise RuntimeError("A invalidação da senha temporária não foi confirmada.")
 
+        # A alteração do usuário está concluída. Falha posterior na Auditoria
+        # não pode desfazer um cadastro já confirmado.
         alteracao_confirmada = True
-        resultado_col = colunas_a.get("RESULTADO", 3)
+
+        # 4) Finaliza o registro de Auditoria.
+        resultado_col = colunas_a["RESULTADO"]
         gs_call(
             sheet_a.update_cell,
             linha_auditoria,
@@ -1803,38 +1820,32 @@ def atualizar_cadastro_temp_com_auditoria(
         return True, "ALTERACAO_CONFIRMADA", campos_texto
 
     except Exception as exc:
-        LOGGER.exception("Falha ao atualizar cadastro temporário com auditoria.")
+        LOGGER.exception("Falha ao atualizar cadastro temporário com Auditoria.")
 
-        # Se os novos dados ainda não foram confirmados, tenta restaurar os
-        # valores anteriores para evitar cadastro parcialmente atualizado.
-        if not alteracao_confirmada:
-            for coluna, valor_anterior in valores_para_reverter.items():
-                try:
-                    gs_call(
-                        sheet_u.update_cell,
-                        linha_usuario,
-                        coluna,
-                        valor_anterior,
-                        _max_tries=1
-                    )
-                except Exception:
-                    LOGGER.exception("Não foi possível reverter um campo do cadastro.")
-            for coluna, valor_anterior in temp_anteriores.items():
-                try:
-                    gs_call(
-                        sheet_u.update_cell,
-                        linha_usuario,
-                        coluna,
-                        valor_anterior,
-                        _max_tries=1
-                    )
-                except Exception:
-                    LOGGER.exception("Não foi possível reverter um campo de senha temporária.")
+        # Somente reverte quando a faixa da aba Usuarios chegou a ser escrita,
+        # mas não pôde ser confirmada. A reversão também usa uma única chamada.
+        if (
+            usuario_escrito
+            and not alteracao_confirmada
+            and linha_usuario is not None
+            and faixa_usuario
+            and valores_faixa_anteriores is not None
+        ):
+            try:
+                gs_call(
+                    sheet_u.update,
+                    faixa_usuario,
+                    [valores_faixa_anteriores],
+                    value_input_option="RAW",
+                    _max_tries=3,
+                    _max_sleep=1.5
+                )
+            except Exception:
+                LOGGER.exception("Não foi possível reverter a faixa do cadastro.")
 
         if sheet_a is not None and linha_auditoria is not None:
             try:
-                headers_a = [str(h).strip() for h in gs_call(sheet_a.row_values, 1)]
-                colunas_a = {h: i + 1 for i, h in enumerate(headers_a)}
+                colunas_a = {h: i + 1 for i, h in enumerate(AUDITORIA_HEADERS)}
                 resultado_falha = (
                     "ALTERACAO_CONFIRMADA_AUDITORIA_PENDENTE"
                     if alteracao_confirmada
@@ -1843,31 +1854,27 @@ def atualizar_cadastro_temp_com_auditoria(
                 gs_call(
                     sheet_a.update_cell,
                     linha_auditoria,
-                    colunas_a.get("RESULTADO", 3),
+                    colunas_a["RESULTADO"],
                     resultado_falha,
                     _max_tries=2,
                     _max_sleep=1.0
                 )
-                if "DETALHES_ALTERACOES" in colunas_a:
-                    atual = gs_call(
-                        sheet_a.cell,
-                        linha_auditoria,
-                        colunas_a["DETALHES_ALTERACOES"],
-                        _max_tries=1
-                    ).value
-                    observacao = (
-                        f"{str(atual or '').strip()} | Falha técnica: "
-                        f"{type(exc).__name__}: {exc}"
-                    )[:1500]
-                    gs_call(
-                        sheet_a.update_cell,
-                        linha_auditoria,
-                        colunas_a["DETALHES_ALTERACOES"],
-                        observacao,
-                        _max_tries=1
-                    )
+
+                detalhe_anterior = detalhes_texto if "detalhes_texto" in locals() else ""
+                observacao = (
+                    f"{detalhe_anterior} | Falha técnica: "
+                    f"{type(exc).__name__}: {exc}"
+                ).strip(" |")[:1500]
+                gs_call(
+                    sheet_a.update_cell,
+                    linha_auditoria,
+                    colunas_a["DETALHES_ALTERACOES"],
+                    observacao,
+                    _max_tries=2,
+                    _max_sleep=1.0
+                )
             except Exception:
-                LOGGER.exception("Não foi possível atualizar o resultado da auditoria.")
+                LOGGER.exception("Não foi possível atualizar o resultado da Auditoria.")
 
         buscar_usuarios_cadastrados.clear()
         buscar_usuarios_admin.clear()
@@ -1878,11 +1885,12 @@ def atualizar_cadastro_temp_com_auditoria(
 
         if alteracao_confirmada:
             return True, "ALTERACAO_CONFIRMADA_AUDITORIA_PENDENTE", ""
-        return False, "ERRO_ATUALIZACAO", ""
+
+        detalhe_erro = f"{type(exc).__name__}: {exc}"[:500]
+        return False, "ERRO_ATUALIZACAO", detalhe_erro
 
     finally:
         lock.release()
-
 
 # ==========================================================
 # LEITURAS (CACHE_DATA)
@@ -4376,14 +4384,28 @@ try:
                                         "página e tente novamente."
                                     )
                                 elif status_temp == "COLUNAS_CADASTRO_NAO_ENCONTRADAS":
+                                    detalhe_colunas = (
+                                        f" Colunas não encontradas: {campos_temp}."
+                                        if campos_temp else ""
+                                    )
                                     st.error(
                                         "Uma ou mais colunas do cadastro não foram localizadas na "
-                                        "aba Usuarios."
+                                        "aba Usuarios." + detalhe_colunas
+                                    )
+                                elif status_temp == "SENHA_ZERO_INICIAL":
+                                    st.error(
+                                        "A nova senha não pode começar com zero quando for formada "
+                                        "somente por números. Escolha outra senha."
                                     )
                                 else:
+                                    detalhe_tecnico = (
+                                        f" Detalhe: {campos_temp}"
+                                        if campos_temp else ""
+                                    )
                                     st.error(
                                         "Não foi possível atualizar o cadastro com segurança. "
                                         "Nenhuma alteração parcial foi mantida. Tente novamente."
+                                        + detalhe_tecnico
                                     )
                     except Exception as ex:
                         st.error(f"Falha ao atualizar cadastro: {ex}")
