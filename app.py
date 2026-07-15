@@ -2900,7 +2900,7 @@ try:
                         if not n_n_ok: missing.append("Nome de Escala")
                         if not n_e_ok: missing.append("E-mail")
                         if not email_ok and n_e_ok: missing.append("E-mail (formato inválido)")
-                        if not tel_is_valid_11(fmt_tel_cad): missing.append("Telefone (ex: 21987654321)")
+                        if not tel_is_valid_11(fmt_tel_cad): missing.append("Telefone (Use DDD + 9 dígitos / ex: 21987654321)")
                         if not n_g_ok: missing.append("Graduação")
                         if not n_l_ok: missing.append("Lotação")
                         if not n_o_ok: missing.append("Origem")
@@ -3819,7 +3819,7 @@ try:
 
                 missing = []
                 if not n_ok: missing.append("Nome de Escala")
-                if not tel_is_valid_11(fmt_tel_up): missing.append("Telefone (ex: 21987654321)")
+                if not tel_is_valid_11(fmt_tel_up): missing.append("Telefone (Use DDD + 9 dígitos / ex: 21987654321)")
                 if not norm_str(novo_grad): missing.append("Graduação")
                 if not l_ok: missing.append("Lotação")
                 if not norm_str(novo_orig): missing.append("Origem")
