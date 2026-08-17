@@ -1984,8 +1984,9 @@ def buscar_limite_dinamico():
 @st.cache_data(ttl=30)
 def buscar_capacidade_onibus_dinamica():
     """
-    Capacidade usada para definir quem fica numerado como vaga normal
-    e quem passa a aparecer como Exc-xx.
+    Capacidade do ônibus configurada pelo ADM.
+    Além de separar vagas normais de Exc-xx, ela funciona como limite real
+    para novas inscrições nas faixas flexíveis 05:00-06:15 e 17:00-18:15.
     """
     try:
         sheet_c = ws_config()
@@ -2230,31 +2231,95 @@ def arquivar_lista_antes_de_limpar(dados_p):
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def obter_estado_operacional(agora=None):
+def obter_estado_operacional(agora=None, qtd_inscritos=None, capacidade_onibus=None):
     """
     Fonte única das regras de abertura e do ciclo exibido no cabeçalho.
-    Isso impede que a lista diga uma coisa e a regra de acesso faça outra.
+
+    Regra especial de fechamento:
+    - até 05:00/17:00, mantém o comportamento normal da lista;
+    - de 05:00 até 06:15 e de 17:00 até 18:15, a lista permanece aberta
+      somente enquanto houver vaga dentro da capacidade do ônibus;
+    - se atingir a capacidade nessa faixa, fecha imediatamente;
+    - se houver desistência e voltar a existir vaga antes de 06:15/18:15,
+      a lista pode reabrir;
+    - às 06:15/18:15, fecha definitivamente para novas inscrições;
+    - a Conferência só é liberada a partir de 06:15/18:15.
+
+    Quando qtd_inscritos/capacidade_onibus não são informados, a função avalia
+    apenas o relógio. Isso é suficiente para rotinas que consultam somente o
+    ciclo; as rotinas de inscrição passam sempre os dados frescos da planilha.
     """
     agora = agora or datetime.now(FUSO_BR)
     t = agora.time()
     wd = agora.weekday()  # seg=0 ... sex=4, sáb=5, dom=6
 
-    # Abertura da lista
-    if wd == 5:  # sábado
-        aberto = False
-    elif wd == 6:  # domingo
-        aberto = t >= time(19, 0)
-    elif wd == 4:  # sexta
-        aberto = not (time(5, 0) <= t < time(7, 0)) and t < time(17, 0)
-    else:  # segunda a quinta
-        aberto = not (
-            (time(5, 0) <= t < time(7, 0))
-            or (time(17, 0) <= t < time(19, 0))
-        )
+    faixa_flexivel = False
+    fechamento_por_lotacao = False
 
+    # Abertura da lista por horário.
+    if wd == 5:  # sábado: sempre fechado
+        aberto = False
+
+    elif wd == 6:  # domingo: abre somente às 19:00
+        aberto = t >= time(19, 0)
+
+    elif wd == 4:  # sexta-feira
+        if t < time(5, 0):
+            aberto = True
+        elif t < time(6, 15):
+            aberto = True
+            faixa_flexivel = True
+        elif t < time(7, 0):
+            aberto = False
+        elif t < time(17, 0):
+            aberto = True
+        elif t < time(18, 15):
+            aberto = True
+            faixa_flexivel = True
+        else:
+            # Na sexta não há abertura às 19h; o próximo ciclo abre domingo às 19h.
+            aberto = False
+
+    else:  # segunda a quinta
+        if t < time(5, 0):
+            aberto = True
+        elif t < time(6, 15):
+            aberto = True
+            faixa_flexivel = True
+        elif t < time(7, 0):
+            aberto = False
+        elif t < time(17, 0):
+            aberto = True
+        elif t < time(18, 15):
+            aberto = True
+            faixa_flexivel = True
+        elif t < time(19, 0):
+            aberto = False
+        else:
+            aberto = True
+
+    # Durante a faixa flexível, a capacidade passa a ser um limite real para
+    # novas inscrições. Fora dela, preserva-se o comportamento anterior,
+    # inclusive a possibilidade de existirem registros Exc-xx.
+    if faixa_flexivel and qtd_inscritos is not None and capacidade_onibus is not None:
+        try:
+            qtd = max(0, int(qtd_inscritos))
+            capacidade = max(1, int(capacidade_onibus))
+            if qtd >= capacidade:
+                aberto = False
+                fechamento_por_lotacao = True
+        except Exception:
+            # Em caso de valor inesperado, não inventa uma lotação. A gravação
+            # ainda fará nova validação protegida antes de inserir a presença.
+            pass
+
+    # A Conferência começa somente no fechamento definitivo, nunca às 05h/17h.
     janela_conferencia = (
-        time(5, 0) < t < time(7, 0)
-        or time(17, 0) < t < time(19, 0)
+        wd in {0, 1, 2, 3, 4}
+        and (
+            time(6, 15) <= t < time(7, 0)
+            or time(18, 15) <= t < time(19, 0)
+        )
     )
 
     # Ciclo mostrado abaixo do título
@@ -2263,8 +2328,8 @@ def obter_estado_operacional(agora=None):
             data_ciclo = agora.date()
             embarque = "06:30"
         elif t < time(19, 0):
-            # Entre 17h e 19h a lista está fechada, mas continua pertencendo
-            # ao embarque das 18:30 da própria sexta-feira.
+            # Mesmo com a flexibilização até 18:15, este período continua
+            # pertencendo ao embarque das 18:30 da própria sexta-feira.
             data_ciclo = agora.date()
             embarque = "18:30"
         else:
@@ -2290,6 +2355,8 @@ def obter_estado_operacional(agora=None):
     return {
         "aberto": aberto,
         "janela_conferencia": janela_conferencia,
+        "faixa_flexivel": faixa_flexivel,
+        "fechamento_por_lotacao": fechamento_por_lotacao,
         "embarque": embarque,
         "data_ciclo": data_ciclo,
     }
@@ -2425,7 +2492,13 @@ def sincronizar_troca_de_ciclo(sheet_p, agora=None):
 
 def verificar_status_e_limpar(sheet_p, dados_p):
     agora = datetime.now(FUSO_BR)
-    estado = obter_estado_operacional(agora)
+    qtd_inscritos = max(0, len(dados_p or []) - 1)
+    capacidade_atual = buscar_capacidade_onibus_dinamica()
+    estado = obter_estado_operacional(
+        agora,
+        qtd_inscritos=qtd_inscritos,
+        capacidade_onibus=capacidade_atual,
+    )
 
     # A leitura cacheada funciona somente como gatilho. A decisão final e a
     # gravação usam uma nova leitura dentro da região de mutação protegida.
@@ -2476,6 +2549,10 @@ def registrar_presenca_se_ausente(sheet_p, usuario):
         # A validação de horário e a eventual troca de ciclo são executadas
         # enquanto nenhuma outra sessão pode gravar ou apagar linhas. Como o
         # lock é RLock, sincronizar_troca_de_ciclo pode reutilizá-lo nesta thread.
+        #
+        # Nesta primeira checagem não precisamos da quantidade de passageiros:
+        # durante a faixa flexível a função mantém a passagem aberta para que a
+        # lotação seja decidida logo abaixo, usando uma leitura fresca do Sheets.
         if not obter_estado_operacional()["aberto"]:
             return False, "LISTA_FECHADA"
 
@@ -2490,9 +2567,26 @@ def registrar_presenca_se_ausente(sheet_p, usuario):
                 _max_sleep=1.0
             )
 
+        # Evita duplicidade antes de avaliar a última vaga.
         for row in (dados_frescos or [])[1:]:
             if len(row) >= 6 and str(row[5]).strip().lower() == email:
                 return False, "JA_REGISTRADA"
+
+        # Validação decisiva feita dentro do lock e com dados frescos. Assim,
+        # quando restar uma única vaga, somente a primeira gravação concluída
+        # poderá ocupá-la; a próxima tentativa encontrará a capacidade atingida.
+        dados_validos = filtrar_linhas_presenca(dados_frescos)
+        qtd_inscritos = max(0, len(dados_validos or []) - 1)
+        capacidade_atual = buscar_capacidade_onibus_dinamica()
+        estado_final = obter_estado_operacional(
+            datetime.now(FUSO_BR),
+            qtd_inscritos=qtd_inscritos,
+            capacidade_onibus=capacidade_atual,
+        )
+        if not estado_final["aberto"]:
+            if estado_final.get("fechamento_por_lotacao"):
+                return False, "LISTA_LOTADA"
+            return False, "LISTA_FECHADA"
 
         agora_str = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
         gs_call(
@@ -2509,6 +2603,7 @@ def registrar_presenca_se_ausente(sheet_p, usuario):
             _max_tries=2,
             _max_sleep=1.0
         )
+        buscar_presenca_atualizada.clear()
         return True, "REGISTRADA"
 
     except Exception:
@@ -2576,6 +2671,10 @@ def excluir_presenca_por_email(sheet_p, email):
             LOGGER.error("Exclusão não confirmada para o e-mail %s.", email)
             return False, "EXCLUSAO_NAO_CONFIRMADA"
 
+        # A desistência pode reabrir uma vaga durante 05:00-06:15/17:00-18:15.
+        # Limpa o cache global para que os próximos acessos enxerguem a nova
+        # quantidade o mais rápido possível.
+        buscar_presenca_atualizada.clear()
         return True, "EXCLUIDA"
 
     except Exception:
@@ -3440,14 +3539,14 @@ try:
             st.info("**CADASTRO E LOGIN:** Use seu e-mail como identificador único.")
             st.markdown("""
             **1. Regras de Horário:**
-            * **Manhã:** Inscrições abertas até às 05:00h. Reabre às 07:00h.
-            * **Tarde:** Inscrições abertas até às 17:00h. Reabre às 19:00h.
-            * **Finais de Semana:** Abrem domingo às 19:00h.
+            * **Manhã:** Até 05:00h mantém o funcionamento normal. Entre **05:00h e 06:15h**, novas inscrições continuam liberadas somente enquanto houver vaga dentro da capacidade do ônibus. Se a capacidade for atingida, a lista fecha; se houver desistência e surgir vaga antes de 06:15h, ela volta a abrir. Às **06:15h** fecha definitivamente para novas inscrições e o próximo ciclo abre às 07:00h.
+            * **Tarde:** Até 17:00h mantém o funcionamento normal. Entre **17:00h e 18:15h**, vale a mesma regra de vagas: lotou, fecha; surgiu vaga por desistência, reabre. Às **18:15h** fecha definitivamente para novas inscrições e o próximo ciclo abre às 19:00h, exceto na sexta-feira, quando permanece fechado até domingo às 19:00h.
+            * **Finais de Semana:** Após o fechamento de sexta-feira, a próxima abertura ocorre domingo às 19:00h.
 
             **2. Observação (1):**
-            * Nos períodos em que a lista ficar suspensa para conferência (05:00h às 07:00h / 17:00h às 19:00h), os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
+            * A **Conferência** fica disponível somente a partir de **06:15h** e de **18:15h**, permanecendo acessível até a troca do ciclo. Os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
             * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Antes de ser zerada, a lista anterior será arquivada automaticamente na aba **Histórico**, onde poderá ser consultada por data e baixada em PDF.
-            * A quantidade de vagas consideradas como "normais" é definida pelo Administrador no painel ADM, no campo **Capacidade do ônibus**. Quem ultrapassar essa capacidade aparecerá como **Exc-xx**.
+            * A quantidade de vagas consideradas como "normais" é definida pelo Administrador no painel ADM, no campo **Capacidade do ônibus**. Antes de 05:00h/17:00h, quem ultrapassar essa capacidade continua aparecendo como **Exc-xx**. Na faixa flexível posterior, a capacidade passa a funcionar como limite para novas inscrições.
 
             **3. Observação (2):**
             * **Ativação de Cadastro e Prioridade:** Na aba **Adm**, os Majores podem entrar com seu login e senha para ativar o Cadastro de novos Usuários, bem como Atribuir Prioridade a quem obter esse direito.
@@ -4635,6 +4734,11 @@ try:
                     st.session_state._force_refresh_presenca = True
                     st.session_state._flash_operacao = ("success", "✅ Sua presença já está registrada.")
                     st.rerun()
+                elif status_gravacao == "LISTA_LOTADA":
+                    st.warning(
+                        "As vagas disponíveis foram preenchidas. A lista ficará fechada enquanto estiver lotada; "
+                        "se houver desistência antes de 06:15h/18:15h, uma vaga poderá ser liberada novamente."
+                    )
                 elif status_gravacao == "LISTA_FECHADA":
                     st.warning("A lista foi fechada antes da conclusão da operação. Atualize a página.")
                 elif status_gravacao in {"TROCA_EM_ANDAMENTO", "TROCA_PENDENTE", "SISTEMA_OCUPADO"}:
@@ -4645,7 +4749,19 @@ try:
                 else:
                     st.error("Não foi possível registrar sua presença agora. Atualize e tente novamente.")
         else:
-            st.info("⌛ Lista fechada para novas inscrições.")
+            qtd_inscritos_tela = max(0, len(dados_p_show or []) - 1)
+            estado_tela = obter_estado_operacional(
+                datetime.now(FUSO_BR),
+                qtd_inscritos=qtd_inscritos_tela,
+                capacidade_onibus=capacidade_onibus,
+            )
+            if estado_tela.get("fechamento_por_lotacao"):
+                st.info(
+                    "🚌 Todas as vagas estão ocupadas. Se houver desistência antes de 06:15h/18:15h, "
+                    "a lista voltará a aceitar novas inscrições. Toque em ATUALIZAR para conferir."
+                )
+            else:
+                st.info("⌛ Lista fechada para novas inscrições.")
 
             # ==========================================================
             # ATUALIZAR DISPONÍVEL MESMO COM LISTA FECHADA
