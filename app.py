@@ -1387,7 +1387,7 @@ def restaurar_usuario_da_auditoria(
         gs_call(
             sheet_u.append_row,
             linha_restaurada,
-            value_input_option="USER_ENTERED",
+            value_input_option="RAW",
             _max_tries=3,
             _max_sleep=1.5
         )
@@ -1512,8 +1512,6 @@ def atualizar_cadastro_temp_com_auditoria(
         return False, "TELEFONE_INVALIDO", ""
     if not nova_senha:
         return False, "SENHA_INVALIDA", ""
-    if nova_senha.isdigit() and nova_senha.startswith("0"):
-        return False, "SENHA_ZERO_INICIAL", ""
 
     lock, adquirido = adquirir_lock_mutacao()
     if not adquirido:
@@ -1899,20 +1897,50 @@ def atualizar_cadastro_temp_com_auditoria(
 # ==========================================================
 # LEITURAS (CACHE_DATA)
 # ==========================================================
+def _get_all_records_usuarios_como_texto(sheet_u):
+    """
+    Lê a aba Usuarios sem permitir que o gspread converta valores numéricos.
+
+    Isso é essencial para senhas como "012345": elas precisam continuar
+    exatamente como texto, inclusive com zeros à esquerda.
+    """
+    rows = gs_call(sheet_u.get_all_values)
+    if not rows:
+        return []
+
+    headers = [str(h).strip() for h in rows[0]]
+    records = []
+
+    for row in rows[1:]:
+        valores = list(row) + [""] * max(0, len(headers) - len(row))
+        valores = valores[:len(headers)]
+
+        # Ignora linhas totalmente vazias, como fazia a leitura anterior na prática.
+        if not any(str(v or "").strip() for v in valores):
+            continue
+
+        records.append({
+            headers[i]: str(valores[i] if i < len(valores) else "")
+            for i in range(len(headers))
+        })
+
+    return records
+
+
 @st.cache_data(ttl=30)
 def buscar_usuarios_cadastrados():
-    """Uso geral (Login/Cadastro/Recuperar)."""
+    """Uso geral (Login/Cadastro/Recuperar), preservando tudo como texto."""
     # Não transforma falha de leitura em lista vazia, pois isso poderia
     # permitir cadastro duplicado ou negar login de usuário existente.
     sheet_u = ws_usuarios()
-    return gs_call(sheet_u.get_all_records)
+    return _get_all_records_usuarios_como_texto(sheet_u)
 
 
 @st.cache_data(ttl=3)
 def buscar_usuarios_admin():
-    """Uso específico do ADM: mais fresco."""
+    """Uso específico do ADM: mais fresco e sem conversão numérica."""
     sheet_u = ws_usuarios()
-    return gs_call(sheet_u.get_all_records)
+    return _get_all_records_usuarios_como_texto(sheet_u)
 
 
 @st.cache_data(ttl=5)
@@ -3502,16 +3530,22 @@ try:
                             elif tel_existe:
                                 st.error("Telefone já cadastrado.")
                             else:
-                                gs_call(sheet_u_escrita.append_row, [
-                                    norm_str(n_n),
-                                    norm_str(n_g),
-                                    norm_str(n_l),
-                                    norm_str(n_p),
-                                    norm_str(n_o),
-                                    norm_str(n_e),
-                                    fmt_tel_cad,
-                                    "PENDENTE"
-                                ])
+                                # RAW é obrigatório aqui para preservar senhas como "012345"
+                                # exatamente como foram digitadas, sem conversão numérica.
+                                gs_call(
+                                    sheet_u_escrita.append_row,
+                                    [
+                                        norm_str(n_n),
+                                        norm_str(n_g),
+                                        norm_str(n_l),
+                                        norm_str(n_p),
+                                        norm_str(n_o),
+                                        norm_str(n_e),
+                                        fmt_tel_cad,
+                                        "PENDENTE"
+                                    ],
+                                    value_input_option="RAW"
+                                )
                                 buscar_usuarios_cadastrados.clear()
                                 buscar_usuarios_admin.clear()
 
@@ -3550,7 +3584,7 @@ try:
 
             **3. Observação (2):**
             * **Ativação de Cadastro e Prioridade:** Na aba **Adm**, os Majores podem entrar com seu login e senha para ativar o Cadastro de novos Usuários, bem como Atribuir Prioridade a quem obter esse direito.
-            * **Atualização de Dados:** Na aba **Recuperar**, gerar senha temporária. Copie ela e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**, ressaltando que ela **não poderá iniciar com zero seguido apenas por números**.  Após isso, basta **Salvar** e o cadastro estará atualizado.
+            * **Atualização de Dados:** Na aba **Recuperar**, gerar senha temporária. Copie ela e a use para fazer login normal.  Após o login, será aberta a ficha de cadastro contendo todos os dados do usuário, bastando alterar o que for necessário, inclusive a **Senha**. Senhas numéricas com zero à esquerda são aceitas normalmente. Após isso, basta **Salvar** e o cadastro estará atualizado.
             * **Prioridade no Embarque:** A quem for atribuída a prioridade, terá embarque garantido no ônibus, desde que assinale no App a sua presença em tempo hábil; e o nome na lista aparecerá formatada em Azul..
             """)
 
@@ -4525,11 +4559,6 @@ try:
                                     st.error(
                                         "Uma ou mais colunas do cadastro não foram localizadas na "
                                         "aba Usuarios." + detalhe_colunas
-                                    )
-                                elif status_temp == "SENHA_ZERO_INICIAL":
-                                    st.error(
-                                        "A nova senha não pode começar com zero quando for formada "
-                                        "somente por números. Escolha outra senha."
                                     )
                                 else:
                                     detalhe_tecnico = (
